@@ -1,0 +1,56 @@
+/* frontend/src/components/TemplateCard.css */
+
+.template-card {
+  border: 2px solid #e0e0e0;
+  border-radius: 12px;
+  padding: 24px;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: white;
+}
+
+.template-card:hover {
+  border-color: #667eea;
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
+}
+
+.template-card.selected {
+  border-color: #667eea;
+  background: #f0f4ff;
+}
+
+.template-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.template-header h3 {
+  font-size: 18px;
+  color: #333;
+  margin: 0;
+}
+
+.checkmark {
+  color: #667eea;
+  font-size: 24px;
+  font-weight: bold;
+}
+
+.template-description {
+  color: #666;
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+
+.template-preview {
+  color: #999;
+  font-size: 12px;
+  line-height: 1.5;
+  font-family: 'Courier New', monospace;
+  background: #f5f5f5;
+  padding: 12px;
+  border-radius: 6px;
+}
+
