@@ -28,49 +28,66 @@ class UserOnboardingService {
         ]
       });
 
-      // If no template selected, auto-select the single active template
-      if (!selectedTemplate) {
+      const ensureTemplateReady = async () => {
         const activeTemplate = await Template.findOne({
-          where: { isActive: true }
+          where: { isActive: true },
+          order: [['id', 'ASC']]
         });
 
-        if (activeTemplate) {
-          // Auto-select the template
-          const [userTemplate] = await UserTemplate.findOrCreate({
-            where: {
-              user_id: userId,
-              template_id: activeTemplate.id
-            },
-            defaults: {
-              userId,
-              templateId: activeTemplate.id,
-              isSelected: true,
-              journalFolderName: 'Daily Journals',
-              journalTimeHour: 6,
-              journalTimeMinute: 0
-            }
-          });
-
-          // If it already existed, update it
-          if (!userTemplate.isSelected) {
-            await userTemplate.update({ isSelected: true });
-          }
-
-          // Reload with template
-          selectedTemplate = await UserTemplate.findOne({
-            where: {
-              user_id: userId,
-              is_selected: true
-            },
-            include: [
-              {
-                model: Template,
-                as: 'Template',
-                required: false
-              }
-            ]
-          });
+        if (!activeTemplate) {
+          throw new Error('No default template configured. Please seed the template first.');
         }
+
+        await this.selectTemplate(userId, activeTemplate.id);
+        await this.confirmTemplateSelection(userId, activeTemplate.id, {
+          journalFolderName: 'Daily Journals',
+          journalTimeHour: 6,
+          journalTimeMinute: 0
+        });
+
+        selectedTemplate = await UserTemplate.findOne({
+          where: {
+            user_id: userId,
+            is_selected: true
+          },
+          include: [
+            {
+              model: Template,
+              as: 'Template',
+              required: false
+            }
+          ]
+        });
+      };
+
+      // Auto provision default template if nothing is selected
+      if (!selectedTemplate) {
+        await ensureTemplateReady();
+      } else if (!selectedTemplate.appsScriptWebappUrl || !selectedTemplate.appsScriptId) {
+        // Template exists but onboarding not fully confirmed (no Apps Script deployed)
+        await this.confirmTemplateSelection(
+          userId,
+          selectedTemplate.templateId,
+          {
+            journalFolderName: selectedTemplate.journalFolderName || 'Daily Journals',
+            journalTimeHour: selectedTemplate.journalTimeHour || 6,
+            journalTimeMinute: selectedTemplate.journalTimeMinute || 0
+          }
+        );
+
+        selectedTemplate = await UserTemplate.findOne({
+          where: {
+            user_id: userId,
+            is_selected: true
+          },
+          include: [
+            {
+              model: Template,
+              as: 'Template',
+              required: false
+            }
+          ]
+        });
       }
 
       return {
@@ -201,15 +218,10 @@ class UserOnboardingService {
           throw new Error(`Failed to create template document: ${docError.message}`);
         }
       } else {
-        // Template document exists - check if it needs the hourly table
-        try {
-          const driveService = new GoogleDriveService(user);
-          await driveService.updateTemplateWithHourlyTable(templateDocId);
-          console.log('[UserOnboardingService] Updated existing template with hourly table');
-        } catch (updateError) {
-          console.warn('[UserOnboardingService] Failed to update template with hourly table:', updateError.message);
-          // Don't fail onboarding if update fails - template might already have table or be in use
-        }
+        // Template document exists - skip updateTemplateWithHourlyTable since we're using
+        // a reference document that already has the correct table structure.
+        // Calling updateTemplateWithHourlyTable would corrupt the table.
+        console.log('[UserOnboardingService] Template document exists, skipping hourly table update (using reference document)');
       }
 
       // Unselect all other templates

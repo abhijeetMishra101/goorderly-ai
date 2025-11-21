@@ -10,6 +10,33 @@ class LLMService {
   constructor(config = {}) {
     this.apiUrl = config.apiUrl || process.env.LLM_API_URL || 'http://localhost:11434';
     this.model = config.model || process.env.LLM_MODEL || 'llama3.2:3b-instruct-q4_K_M';
+    this._healthCheckCache = null; // Cache health check result for 30 seconds
+    this._healthCheckTime = 0;
+  }
+
+  /**
+   * Check if Ollama is running and accessible
+   * @returns {Promise<boolean>} True if Ollama is available
+   */
+  async checkHealth() {
+    // Cache health check for 30 seconds to avoid too many requests
+    const now = Date.now();
+    if (this._healthCheckCache !== null && (now - this._healthCheckTime) < 30000) {
+      return this._healthCheckCache;
+    }
+
+    try {
+      const response = await axios.get(`${this.apiUrl}/api/tags`, {
+        timeout: 2000 // Quick 2s check
+      });
+      this._healthCheckCache = response.status === 200;
+      this._healthCheckTime = now;
+      return this._healthCheckCache;
+    } catch (error) {
+      this._healthCheckCache = false;
+      this._healthCheckTime = now;
+      return false;
+    }
   }
 
   /**
@@ -19,6 +46,12 @@ class LLMService {
    * @returns {Promise<Object>} Structured extraction
    */
   async extractVoiceEntry(text, context = {}) {
+    // Quick health check before making request
+    const isHealthy = await this.checkHealth();
+    if (!isHealthy) {
+      throw new Error('LLM service unavailable - Ollama is not running or not accessible');
+    }
+
     const prompt = this._buildPrompt(text, context);
     
     try {
@@ -29,10 +62,10 @@ class LLMService {
         options: {
           temperature: 0.3, // Lower = more deterministic
           top_p: 0.9,
-          num_predict: 80 // Reduced from 150 for faster CPU inference
+          num_predict: 40 // Further reduced from 55 for faster inference
         }
       }, {
-        timeout: 30000 // 30 second timeout for LLM requests (increased for CPU inference)
+        timeout: 7000 // 7 second timeout for faster failure and fallback
       });
 
       const result = this._parseResponse(response.data.response);
@@ -48,7 +81,13 @@ class LLMService {
       
       return result;
     } catch (error) {
-      console.error('LLM API error:', error.message);
+      const errorType = error.code === 'ECONNABORTED' ? 'timeout' : 
+                       error.code === 'ECONNREFUSED' ? 'connection_refused' : 
+                       'unknown';
+      console.error(`[LLM Service] ${errorType} error:`, error.message);
+      if (errorType === 'timeout') {
+        console.warn('[LLM Service] Request timed out after 7s, falling back to simple detection');
+      }
       // Throw error so SmartRouter can use its fallback
       throw error;
     }

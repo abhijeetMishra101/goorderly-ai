@@ -95,15 +95,13 @@ function createJournalRoutes() {
         });
       }
 
-      // Update template with hourly table
-      const result = await driveService.updateTemplateWithHourlyTable(templateDocId);
-
+      // Templates are now created from a reference document and should not be
+      // modified programmatically. The updateTemplateWithHourlyTable function
+      // would corrupt the table structure.
       res.json({
         success: true,
-        message: result.alreadyHasTable 
-          ? 'Template already has the hourly table' 
-          : 'Template updated successfully with hourly table',
-        alreadyHasTable: result.alreadyHasTable
+        message: 'Template is managed from reference document and does not need updating',
+        alreadyHasTable: true
       });
     } catch (error) {
       res.status(500).json({

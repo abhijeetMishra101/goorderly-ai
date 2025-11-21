@@ -26,7 +26,9 @@ class SmartRouter {
     const simpleResult = this._trySimpleDetection(text, context.currentTime);
 
     // If confidence is high enough, use regex result (no LLM call)
-    if (simpleResult.confidence >= 0.8) {
+    // Lowered threshold from 0.8 to 0.5 to avoid LLM calls for more entries
+    // This reduces timeout issues when LLM is slow or unavailable
+    if (simpleResult.confidence >= 0.5) {
       return {
         ...simpleResult,
         usedLLM: false
@@ -48,7 +50,7 @@ class SmartRouter {
       const llmResult = await Promise.race([
         this.llmService.extractVoiceEntry(text, context),
         new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('LLM timeout')), 28000) // 28s timeout (before 30s axios timeout)
+          setTimeout(() => reject(new Error('LLM timeout')), 6000) // 6s timeout for faster failure
         )
       ]);
       return {
@@ -57,7 +59,15 @@ class SmartRouter {
       };
     } catch (error) {
       // Fallback to simple detection if LLM fails or times out
-      console.warn('LLM extraction failed, using fallback:', error.message);
+      const errorType = error.message.includes('timeout') ? 'timeout' : 
+                       error.message.includes('unavailable') ? 'unavailable' : 'error';
+      console.warn(`[SmartRouter] LLM extraction failed (${errorType}), using fallback:`, error.message);
+      
+      // If LLM is unavailable, log it but don't spam
+      if (errorType === 'unavailable') {
+        console.warn('[SmartRouter] LLM service appears to be down. Using simple detection for all entries.');
+      }
+      
       return {
         ...simpleResult,
         usedLLM: false,
@@ -74,6 +84,9 @@ class SmartRouter {
    */
   _trySimpleDetection(text, currentTime) {
     const lowerText = text.toLowerCase();
+
+    // Detect retrospective intent (describing something that already happened)
+    const isRetrospective = this._detectRetrospectiveIntent(text);
 
     // Check for reminder patterns first (low confidence - needs LLM for date parsing)
     // More flexible patterns to catch variations like "remind me to", "remind me tomorrow", etc.
@@ -111,18 +124,21 @@ class SmartRouter {
     // Check for time references like "7 o'clock", "at 7", "7 AM", "7 PM", etc.
     const timeReference = this._detectTimeReference(text, currentTime || new Date());
     
-    // Pattern matching for common contexts
+    // Pattern matching for common contexts (expanded for better detection)
     const patterns = {
-      meeting: /meeting|conference|call|standup|sync/i,
-      fitness: /gym|workout|exercise|run|jog|fitness|pushup|crunches/i,
-      errand: /store|shop|grocery|repair|appointment|errand|pickup/i,
-      meal: /lunch|dinner|breakfast|eat|meal|restaurant|food/i,
-      work: /work|office|desk|coding|development|project/i,
-      personal: /home|family|personal|relax|break/i
+      meeting: /meeting|conference|call|standup|sync|zoom|teams|discuss|chat/i,
+      fitness: /gym|workout|exercise|run|jog|fitness|pushup|crunches|yoga|meditation|walk/i,
+      errand: /store|shop|grocery|repair|appointment|errand|pickup|delivery|pharmacy|bank/i,
+      meal: /lunch|dinner|breakfast|eat|meal|restaurant|food|coffee|snack|drink/i,
+      work: /work|office|desk|coding|development|project|task|deadline|meeting|email/i,
+      personal: /home|family|personal|relax|break|rest|sleep|wake|shower|read/i,
+      note: /note|reminder|remember|idea|thought|journal|log/i
     };
 
     let detectedContext = null;
-    let confidence = 0.3; // Low confidence default
+    // Start with higher default confidence for generic entries to avoid LLM calls
+    // Most entries are simple observations or tasks that don't need LLM processing
+    let confidence = 0.6; // Medium confidence default (above 0.5 threshold)
 
     // Check for context patterns
     for (const [context, pattern] of Object.entries(patterns)) {
@@ -132,6 +148,11 @@ class SmartRouter {
         break;
       }
     }
+    
+    // If we have both time reference and context, increase confidence even more
+    if (timeReference && detectedContext) {
+      confidence = 0.95; // Very high confidence
+    }
 
     // Use detected time reference if found, otherwise infer from current time
     const timeSlot = timeReference || this._inferTimeSlot(currentTime || new Date());
@@ -139,7 +160,13 @@ class SmartRouter {
     
     // If we detected a time reference, increase confidence
     if (timeReference) {
-      confidence = Math.max(confidence, 0.7); // Medium-high confidence for time detection
+      confidence = Math.max(confidence, 0.8); // High confidence for time detection
+    }
+    
+    // For very short entries (likely simple observations), give higher confidence
+    // This avoids LLM calls for simple phrases like "Testing changes again"
+    if (text.trim().split(/\s+/).length <= 5 && !timeReference && !detectedContext) {
+      confidence = 0.65; // Medium-high confidence for short generic entries
     }
 
     return {
@@ -147,9 +174,36 @@ class SmartRouter {
       context: detectedContext,
       timeSlot,
       hasExplicitTime, // Flag to indicate if time was explicitly mentioned
+      isRetrospective,
       confidence,
       action: text
     };
+  }
+
+  /**
+   * Detect if the entry is talking about something that already happened
+   * (retrospective journaling) vs a future intent/reminder.
+   * @param {string} text
+   * @returns {boolean}
+   */
+  _detectRetrospectiveIntent(text) {
+    const lower = text.toLowerCase();
+
+    // Strong future markers – if these are present, don't treat as retrospective
+    const futureMarkers = /\b(will|gonna|going to|later|tomorrow|next week|next month|next year)\b/;
+    if (futureMarkers.test(lower)) {
+      return false;
+    }
+
+    // Past-tense verbs / patterns that usually describe completed actions
+    // Extended with common daily‑routine verbs like "dropped" so entries like
+    // "Dropped Piku to school bus stop at 7 AM" are treated as retrospective.
+    const pastVerbs = /\b(woke|was|were|did|went|had|ate|slept|finished|completed|started|stopped|met|called|talked|worked|wrote|read|ran|walked|dropped|picked up|picked|left|reached|arrived|drove|came|went out|got back|continued)\b/;
+
+    // Explicit retrospective phrases
+    const retrospectivePhrases = /\b(earlier today|this morning|this afternoon|this evening|a while ago|just now|previously|before now)\b/;
+
+    return pastVerbs.test(lower) || retrospectivePhrases.test(lower);
   }
 
   /**
@@ -165,38 +219,60 @@ class SmartRouter {
     let ampm = null;
     
     // Try patterns in order of specificity (most specific first)
-    // Pattern 1: "7:00", "7:00 AM" (most specific - has minutes)
-    let match = text.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+   
+   // Pattern 1: "7:00", "7:00 AM" (most specific - has minutes)
+let match = text.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+if (match) {
+  hour = parseInt(match[1], 10);
+  minute = parseInt(match[2], 10);
+  ampm = match[3] ? match[3].toUpperCase() : null;
+} else {
+  // Pattern 1.5: compact time like "730" or "0730" -> 7:30, "1130" -> 11:30
+  match = text.match(/\b(\d{3,4})\b/);
+  if (match) {
+    const digits = match[1];
+    let rawHour;
+    let rawMinute;
+    if (digits.length === 3) {
+      rawHour = parseInt(digits.charAt(0), 10);
+      rawMinute = parseInt(digits.slice(1), 10);
+    } else {
+      rawHour = parseInt(digits.slice(0, 2), 10);
+      rawMinute = parseInt(digits.slice(2), 10);
+    }
+    if (rawHour >= 0 && rawHour <= 23 && rawMinute >= 0 && rawMinute < 60) {
+      hour = rawHour;
+      minute = rawMinute;
+      ampm = null;
+    }
+  }
+
+  if (hour === null) {
+    // Pattern 2: "7 AM", "7 PM"
+    match = text.match(/\b(\d{1,2})\s*(am|pm)\b/i);
     if (match) {
       hour = parseInt(match[1], 10);
-      minute = parseInt(match[2], 10);
-      ampm = match[3] ? match[3].toUpperCase() : null;
+      minute = 0;
+      ampm = match[2].toUpperCase();
     } else {
-      // Pattern 2: "7 AM", "7 PM"
-      match = text.match(/\b(\d{1,2})\s*(am|pm)\b/i);
+      // Pattern 3: "at 7", "at 7 AM"
+      match = text.match(/\bat\s+(\d{1,2})(?:\s*(am|pm))?/i);
       if (match) {
         hour = parseInt(match[1], 10);
         minute = 0;
-        ampm = match[2].toUpperCase();
+        ampm = match[2] ? match[2].toUpperCase() : null;
       } else {
-        // Pattern 3: "at 7", "at 7 AM"
-        match = text.match(/\bat\s+(\d{1,2})(?:\s*(am|pm))?/i);
+        // Pattern 4: "7 o'clock", "7 o clock"
+        match = text.match(/(\d{1,2})\s*o['']?clock/i);
         if (match) {
           hour = parseInt(match[1], 10);
           minute = 0;
-          ampm = match[2] ? match[2].toUpperCase() : null;
-        } else {
-          // Pattern 4: "7 o'clock", "7 o clock"
-          match = text.match(/(\d{1,2})\s*o['']?clock/i);
-          if (match) {
-            hour = parseInt(match[1], 10);
-            minute = 0;
-            ampm = null;
-          }
+          ampm = null;
         }
       }
     }
-    
+  }
+} 
     // If we found a time reference, process it
     if (hour !== null) {
       // If no AM/PM specified, we need to infer it
@@ -256,10 +332,12 @@ class SmartRouter {
       if (ampm === 'PM' && hour24 !== 12) hour24 += 12;
       if (ampm === 'AM' && hour24 === 12) hour24 = 0;
       
-      // Calculate time slot (round to nearest 30-minute slot)
-      const slotStartMinute = minute < 30 ? 0 : 30;
-      const slotEndMinute = slotStartMinute === 0 ? 30 : 0;
-      const slotEndHour = slotStartMinute === 0 ? hour24 : (hour24 + 1) % 24;
+      // Calculate time slot (round to nearest hour slot for 1-hour slots)
+      // Always use :00 for start and end minutes to match table format
+      const slotStartMinute = 0;
+      const slotEndMinute = 0;
+      // End hour should always be start hour + 1 (or wrap to 0 if 24)
+      const slotEndHour = (hour24 + 1) % 24;
       
       // Convert to 12-hour format
       const formatTime12 = (h, m) => {
@@ -283,11 +361,12 @@ class SmartRouter {
     const hour = currentTime.getHours();
     const minute = currentTime.getMinutes();
 
-    // Round DOWN to nearest 30-minute slot (so 16:51 becomes 4:30-5:30 PM, not 5:30-6:00 PM)
-    const slotStartMinute = minute < 30 ? 0 : 30;
-    const slotStartHour = hour; // Always use current hour (round down)
-    const slotEndMinute = slotStartMinute === 0 ? 30 : 0;
-    const slotEndHour = slotStartMinute === 0 ? slotStartHour : (slotStartHour + 1) % 24;
+    // Round DOWN to nearest hour (always create 1-hour slots to match template)
+    // Template uses 1-hour slots like "5:00-6:00 PM", not 30-minute slots
+    const slotStartMinute = 0; // Always start at :00
+    const slotStartHour = hour; // Use current hour
+    const slotEndMinute = 0; // Always end at :00
+    const slotEndHour = (hour + 1) % 24; // Next hour (wraps at midnight)
 
     // Convert to 12-hour format with AM/PM (matches table format)
     const formatTime12 = (h, m) => {
@@ -295,8 +374,32 @@ class SmartRouter {
       return `${h12}:${String(m).padStart(2, '0')}`;
     };
 
-    const ampm = slotEndHour >= 12 ? 'PM' : 'AM';
-    return `${formatTime12(slotStartHour, slotStartMinute)} - ${formatTime12(slotEndHour, slotEndMinute)} ${ampm}`;
+    // Determine AM/PM based on start hour (since both are in same period for 1-hour slots)
+    const isPM = slotStartHour >= 12;
+    const ampm = isPM ? 'PM' : 'AM';
+    
+    const startTime = formatTime12(slotStartHour, slotStartMinute);
+    const endTime = formatTime12(slotEndHour, slotEndMinute);
+    
+    // Match template format exactly:
+    // - AM slots: "5:00 - 6:00 AM" (with spaces around dash)
+    // - PM slots: "5:00-6:00 PM" (no spaces around dash, except special cases)
+    // - Special: "11:00AM - 12:00 PM" (no space before AM, space before PM)
+    // - Special: "11:00 PM -12:00 AM" (space before PM, no space before AM)
+    
+    if (slotStartHour === 11 && slotEndHour === 12 && !isPM) {
+      // "11:00AM - 12:00 PM"
+      return `${startTime}AM - ${endTime} PM`;
+    } else if (slotStartHour === 23 && slotEndHour === 0) {
+      // "11:00 PM -12:00 AM"
+      return `${startTime} PM -${endTime} AM`;
+    } else if (isPM) {
+      // PM slots: "5:00-6:00 PM" (no spaces around dash)
+      return `${startTime}-${endTime} ${ampm}`;
+    } else {
+      // AM slots: "5:00 - 6:00 AM" (with spaces around dash)
+      return `${startTime} - ${endTime} ${ampm}`;
+    }
   }
 }
 

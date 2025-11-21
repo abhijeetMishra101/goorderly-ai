@@ -36,6 +36,348 @@ class JournalService {
   }
 
   /**
+   * Validate if template matches the ideal structure
+   * @private
+   * @param {string} templateDocId - Template document ID
+   * @returns {Promise<boolean>} True if template is valid, false otherwise
+   */
+  async _validateTemplate(templateDocId) {
+    try {
+      await this.driveService._initializeAPIs();
+      
+      // Check if document exists
+      try {
+        const doc = await this.driveService.docs.documents.get({ documentId: templateDocId });
+        
+        // Check for required sections
+        const fullText = doc.data.body.content
+          .map(el => {
+            if (el.paragraph && el.paragraph.elements) {
+              return el.paragraph.elements.map(e => e.textRun?.content || '').join('');
+            }
+            return '';
+          })
+          .join('');
+        
+        // Check for required markers
+        const hasDateMarker = fullText.includes('🗓️ Daily Journal – {DATE}');
+        const hasToDoList = fullText.includes('📋 To-Do List');
+        const hasNotes = fullText.includes('🧠 Notes / Quick Logs');
+        const hasFreeForm = fullText.includes('📝 Free-form Journal');
+        const hasHourlyPlan = fullText.includes('⏰ Hourly Plan');
+        const hasEndOfDay = fullText.includes('📊 End of Day Analysis');
+        
+        if (!hasDateMarker || !hasToDoList || !hasNotes || !hasFreeForm || !hasHourlyPlan || !hasEndOfDay) {
+          console.log('[JournalService] Template missing required sections');
+          return false;
+        }
+        
+        // Check for table structure
+        const tableEl = doc.data.body.content.find(el => el.table);
+        if (!tableEl || !tableEl.table) {
+          console.log('[JournalService] Template missing hourly plan table');
+          return false;
+        }
+        
+        const table = tableEl.table;
+        const rows = table.tableRows || [];
+        
+        // Should have 25 rows (1 header + 24 time slots)
+        if (rows.length !== 25) {
+          console.log(`[JournalService] Template table has ${rows.length} rows, expected 25`);
+          return false;
+        }
+        
+        // Check header row
+        if (rows.length > 0) {
+          const headerRow = rows[0];
+          const headerCells = headerRow.tableCells || [];
+          if (headerCells.length >= 2) {
+            const headerCell0Text = headerCells[0].content
+              ?.map(para => para.paragraph?.elements?.map(e => e.textRun?.content || '').join('') || '')
+              .join('') || '';
+            const headerCell1Text = headerCells[1].content
+              ?.map(para => para.paragraph?.elements?.map(e => e.textRun?.content || '').join('') || '')
+              .join('') || '';
+            
+            if (!headerCell0Text.includes('Time Slot') || !headerCell1Text.includes('Task Description')) {
+              console.log('[JournalService] Template table header is incorrect');
+              return false;
+            }
+          }
+        }
+        
+        // Check for corruption (known corruption patterns)
+        const hasCorruption = fullText.includes('TiTas') || 
+                             fullText.match(/12:001:00/) || 
+                             fullText.match(/1:00 2:00 3:00/);
+        
+        if (hasCorruption) {
+          console.log('[JournalService] Template contains corrupted content');
+          return false;
+        }
+        
+        return true;
+      } catch (error) {
+        // Document doesn't exist or can't be accessed
+        if (error.code === 404 || error.message.includes('not found') || error.message.includes('File not found')) {
+          console.log('[JournalService] Template document not found');
+          return false;
+        }
+        throw error;
+      }
+    } catch (error) {
+      console.error('[JournalService] Error validating template:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * Recreate template from scratch with ideal structure
+   * @private
+   * @returns {Promise<string>} New template document ID
+   */
+  async _recreateTemplateFromScratch() {
+    try {
+      const userConfig = await this._getUserConfig();
+      const driveService = this.driveService;
+      await driveService._initializeAPIs();
+      
+      console.log('[JournalService] Recreating template from scratch...');
+      
+      const oldTemplateDocId = userConfig.templateId;
+      
+      // Delete old template if it exists
+      if (oldTemplateDocId && oldTemplateDocId !== 'PLACEHOLDER_WILL_BE_CREATED_ON_USER_SELECTION') {
+        try {
+          await driveService.drive.files.delete({ fileId: oldTemplateDocId });
+          console.log('[JournalService] Deleted old template');
+        } catch (error) {
+          // Ignore if already deleted
+        }
+      }
+      
+      // Create brand new empty document
+      const createResponse = await driveService.docs.documents.create({
+        requestBody: { title: 'GoOrderly Template - Daily Journal' }
+      });
+      const newDocId = createResponse.data.documentId;
+      console.log(`[JournalService] Created new document: ${newDocId}`);
+      
+      // Insert content before table
+      const beforeTable = `🗓️ Daily Journal – {DATE}\n\n📋 To-Do List #office #personal #health\n\n🧠 Notes / Quick Logs\n\n📝 Free-form Journal (tag people/topics using #hashtag)\n\nWrite anything here. Tag relevant people or topics inline using #e.g. #Andrew, #FocusTime, #Feedback.\n\n⏰ Hourly Plan\n\n`;
+      
+      await driveService.docs.documents.batchUpdate({
+        documentId: newDocId,
+        requestBody: {
+          requests: [{
+            insertText: {
+              location: { index: 1 },
+              text: beforeTable
+            }
+          }]
+        }
+      });
+      
+      // Get current index
+      let doc = await driveService.docs.documents.get({ documentId: newDocId });
+      let insertIndex = 1;
+      if (doc.data.body.content && doc.data.body.content.length > 0) {
+        const lastEl = doc.data.body.content[doc.data.body.content.length - 1];
+        insertIndex = lastEl.endIndex || insertIndex;
+      }
+      
+      // Create table (25 rows: 1 header + 24 time slots)
+      await driveService.docs.documents.batchUpdate({
+        documentId: newDocId,
+        requestBody: {
+          requests: [{
+            insertTable: {
+              location: { index: insertIndex - 1 },
+              rows: 25,
+              columns: 2
+            }
+          }]
+        }
+      });
+      
+      // Wait for table to be created
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Get fresh document and find table
+      doc = await driveService.docs.documents.get({ documentId: newDocId });
+      const tableEl = doc.data.body.content.find(el => el.table);
+      if (!tableEl || !tableEl.table) {
+        throw new Error('Table was not created');
+      }
+      
+      const table = tableEl.table;
+      const rows = table.tableRows || [];
+      
+      // Clear all cells first
+      const cellsToClear = [];
+      for (const row of rows) {
+        const cells = row.tableCells || [];
+        for (const cell of cells) {
+          if (cell.content && cell.content.length > 0) {
+            const firstPara = cell.content[0];
+            const lastPara = cell.content[cell.content.length - 1];
+            const start = firstPara.startIndex || cell.startIndex + 1;
+            const end = (lastPara.endIndex || cell.endIndex) - 1;
+            if (end > start) {
+              cellsToClear.push({ start, end });
+            }
+          }
+        }
+      }
+      
+      cellsToClear.sort((a, b) => b.end - a.end);
+      
+      for (const range of cellsToClear) {
+        try {
+          await driveService.docs.documents.batchUpdate({
+            documentId: newDocId,
+            requestBody: {
+              requests: [{
+                deleteContentRange: {
+                  range: { startIndex: range.start, endIndex: range.end }
+                }
+              }]
+            }
+          });
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (error) {
+          // Ignore errors
+        }
+      }
+      
+      // Wait and refresh
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      doc = await driveService.docs.documents.get({ documentId: newDocId });
+      const freshTableEl = doc.data.body.content.find(el => el.table);
+      if (!freshTableEl || !freshTableEl.table) {
+        throw new Error('Table disappeared');
+      }
+      const freshRows = freshTableEl.table.tableRows || [];
+      
+      // Time slots
+      const timeSlots = [
+        '12:00 - 1:00 AM', '1:00 - 2:00 AM', '2:00 - 3:00 AM', '3:00 - 4:00 AM',
+        '4:00 - 5:00 AM', '5:00 - 6:00 AM', '6:00 - 7:00 AM', '7:00 - 8:00 AM',
+        '8:00 - 9:00 AM', '9:00 - 10:00 AM', '10:00 - 11:00 AM', '11:00AM - 12:00 PM',
+        '12:00-1:00 PM', '1:00-2:00 PM', '2:00-3:00 PM', '3:00-4:00 PM',
+        '4:00-5:00 PM', '5:00-6:00 PM', '6:00-7:00 PM', '7:00-8:00 PM',
+        '8:00-9:00 PM', '9:00-10:00 PM', '10:00-11:00 PM', '11:00 PM -12:00 AM'
+      ];
+      
+      // Header row
+      if (freshRows.length > 0) {
+        const headerRow = freshRows[0];
+        const headerCells = headerRow.tableCells || [];
+        
+        if (headerCells.length > 0) {
+          await driveService.docs.documents.batchUpdate({
+            documentId: newDocId,
+            requestBody: {
+              requests: [{
+                insertText: {
+                  location: { index: headerCells[0].startIndex + 1 },
+                  text: 'Time Slot'
+                }
+              }]
+            }
+          });
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        
+        if (headerCells.length > 1) {
+          await driveService.docs.documents.batchUpdate({
+            documentId: newDocId,
+            requestBody: {
+              requests: [{
+                insertText: {
+                  location: { index: headerCells[1].startIndex + 1 },
+                  text: 'Task Description'
+                }
+              }]
+            }
+          });
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+      
+      // Time slot rows - insert one at a time
+      for (let i = 0; i < timeSlots.length && i + 1 < freshRows.length; i++) {
+        doc = await driveService.docs.documents.get({ documentId: newDocId });
+        const currentTableEl = doc.data.body.content.find(el => el.table);
+        if (!currentTableEl || !currentTableEl.table) break;
+        
+        const currentRows = currentTableEl.table.tableRows || [];
+        if (i + 1 >= currentRows.length) break;
+        
+        const row = currentRows[i + 1];
+        const cells = row.tableCells || [];
+        
+        if (cells.length > 0) {
+          await driveService.docs.documents.batchUpdate({
+            documentId: newDocId,
+            requestBody: {
+              requests: [{
+                insertText: {
+                  location: { index: cells[0].startIndex + 1 },
+                  text: timeSlots[i]
+                }
+              }]
+            }
+          });
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+      
+      // Insert content after table
+      doc = await driveService.docs.documents.get({ documentId: newDocId });
+      const finalTableEl = doc.data.body.content.find(el => el.table);
+      const afterTableIndex = finalTableEl ? finalTableEl.endIndex : insertIndex;
+      
+      const afterTable = `📊 End of Day Analysis\n\n🎯 What went well\n\n🚫 What didn't go well\n\n- \n\n📈 Productivity Score (1–10): \n\n🧠 Mental/Physical State:\n\nExample: Alert morning, post-lunch slump\n\n🌱 What to improve tomorrow:\n\n- `;
+      
+      await driveService.docs.documents.batchUpdate({
+        documentId: newDocId,
+        requestBody: {
+          requests: [{
+            insertText: {
+              location: { index: afterTableIndex },
+              text: '\n\n' + afterTable
+            }
+          }]
+        }
+      });
+      
+      // Update database
+      const { Template, UserTemplate } = require('../models');
+      const userTemplate = await UserTemplate.findOne({
+        where: {
+          user_id: this.user.id,
+          is_selected: true
+        },
+        include: [{ model: Template, as: 'Template' }]
+      });
+      
+      if (userTemplate && userTemplate.Template) {
+        await userTemplate.Template.update({
+          googleDocId: newDocId
+        });
+        console.log(`[JournalService] Updated template in database with new document ID`);
+      }
+      
+      console.log(`[JournalService] Successfully recreated template: ${newDocId}`);
+      return newDocId;
+    } catch (error) {
+      throw new Error(`Failed to recreate template: ${error.message}`);
+    }
+  }
+
+  /**
    * Creates a new daily journal
    * @param {string} date - Date in YYYY-MM-DD format (optional, defaults to today)
    * @param {Object} options - Additional options
@@ -50,16 +392,22 @@ class JournalService {
 
     try {
       // Get user's configuration from database
-      const userConfig = await this._getUserConfig();
-
-      // Ensure template has the hourly table before creating journal
-      try {
-        await this.driveService.updateTemplateWithHourlyTable(userConfig.templateId);
-        console.log('[JournalService] Template checked/updated for hourly table');
-      } catch (templateUpdateError) {
-        console.warn('[JournalService] Failed to update template with hourly table:', templateUpdateError.message);
-        // Continue anyway - template might already have table or update might not be critical
+      let userConfig = await this._getUserConfig();
+      
+      // Validate template before creating journal
+      console.log('[JournalService] Validating template before journal creation...');
+      const isTemplateValid = await this._validateTemplate(userConfig.templateId);
+      
+      if (!isTemplateValid) {
+        console.warn('[JournalService] Template is missing or invalid, recreating...');
+        const newTemplateId = await this._recreateTemplateFromScratch();
+        userConfig.templateId = newTemplateId;
+        console.log('[JournalService] Template recreated successfully');
       }
+
+      // Skip updateTemplateWithHourlyTable - we're using a reference document that already
+      // has the correct table structure. Calling updateTemplateWithHourlyTable would corrupt it.
+      // The template should be created once from the reference document and never modified.
 
       // Try to use Apps Script web app if available
       if (userConfig.appsScriptWebappUrl) {
@@ -81,7 +429,27 @@ class JournalService {
           const result = response.data;
 
           if (result.error) {
-            throw new Error(result.error);
+            // Check if error is due to missing template
+            const isTemplateMissing = result.error.includes('File not found') ||
+                                      result.error.includes('404') ||
+                                      result.error.includes('not found');
+            
+            if (isTemplateMissing) {
+              console.warn('[JournalService] Template missing in Apps Script, attempting auto-recovery...');
+              
+              // Recreate template from scratch
+              const newTemplateId = await this._recreateTemplateFromScratch();
+              
+              // Update userConfig with new template ID for retry
+              userConfig.templateId = newTemplateId;
+              
+              // Retry Apps Script call (it should now work with the new template)
+              // But Apps Script might still have old template ID, so fall through to direct API
+              console.log('[JournalService] Template recreated, falling back to direct API for this request');
+              throw new Error('Template recreated, retry with direct API');
+            } else {
+              throw new Error(result.error);
+            }
           }
 
           // Process reminders from previous journals
@@ -96,8 +464,13 @@ class JournalService {
             url: result.url
           };
         } catch (appsScriptError) {
-          console.warn('[JournalService] Apps Script creation failed, falling back to direct API:', appsScriptError.message);
-          // Fall through to direct API approach
+          // If it's a template recreation error, we want to fall through
+          if (appsScriptError.message.includes('Template recreated')) {
+            // Fall through to direct API approach
+          } else {
+            console.warn('[JournalService] Apps Script creation failed, falling back to direct API:', appsScriptError.message);
+            // Fall through to direct API approach
+          }
         }
       }
 
@@ -106,11 +479,41 @@ class JournalService {
       const folder = await this.driveService.getOrCreateFolder(userConfig.folderName);
 
       // Duplicate template
-      const journalDoc = await this.driveService.duplicateTemplate(
-        journalDate,
-        folder.id,
-        userConfig.templateId
-      );
+      let journalDoc;
+      try {
+        journalDoc = await this.driveService.duplicateTemplate(
+          journalDate,
+          folder.id,
+          userConfig.templateId
+        );
+      } catch (templateError) {
+        // Check if error is due to missing template (404 or file not found)
+        const isTemplateMissing = templateError.message.includes('File not found') ||
+                                  templateError.message.includes('404') ||
+                                  templateError.message.includes('not found');
+        
+        if (isTemplateMissing) {
+          console.warn('[JournalService] Template document missing, attempting auto-recovery...');
+          
+          // Recreate template from scratch
+          const newTemplateId = await this._recreateTemplateFromScratch();
+          
+          // Update userConfig with new template ID
+          userConfig.templateId = newTemplateId;
+          
+          // Retry journal creation with new template ID
+          journalDoc = await this.driveService.duplicateTemplate(
+            journalDate,
+            folder.id,
+            newTemplateId
+          );
+          
+          console.log('[JournalService] Successfully recovered template and created journal');
+        } else {
+          // Re-throw if it's a different error
+          throw templateError;
+        }
+      }
 
       // Process reminders from previous journals
       await this._processRemindersForNewJournal(journalDoc.id, journalDate, folder.id);
@@ -403,12 +806,17 @@ class JournalService {
     console.log(`[DEBUG] Detected context: ${detectedContext}`);
     console.log(`[DEBUG] Time slot: ${timeSlot ? `"${timeSlot}"` : 'null/undefined'}`);
 
+    // Initialize entryTime to current time (will be adjusted for retrospective entries)
+    let entryTime = currentTime;
+
     // Check if time slot is in the past - if so, convert to reminder for tomorrow
     // BUT only if the user explicitly mentioned a time (not inferred from current time)
+    // AND only if it's NOT a retrospective entry (past tense verbs like "dropped", "woke", etc.)
     // If time was inferred from current time, always use it for today (even if slightly in the past)
     const hasExplicitTime = extractedData.hasExplicitTime === true; // Only true if explicitly set to true
+    const isRetrospective = extractedData.isRetrospective === true; // Check if this is describing a past event
     
-    if (timeSlot && hasExplicitTime) {
+    if (timeSlot && hasExplicitTime && !isRetrospective) {
       const timeSlotInfo = this._parseTimeSlotForReminder(timeSlot, currentTime);
       if (timeSlotInfo && timeSlotInfo.isPast) {
         console.log(`[DEBUG] Time slot "${timeSlot}" is in the past and was explicitly mentioned, converting to reminder for ${timeSlotInfo.targetDate}`);
@@ -439,6 +847,21 @@ class JournalService {
           convertedFromTimeSlot: true
         };
       }
+    } else if (timeSlot && hasExplicitTime && isRetrospective) {
+      // For retrospective entries, use the slot's start time for row matching
+      // This ensures entries like "Dropped Aro to school bus stop AM" at 7AM go into the 7AM slot for today
+      console.log(`[DEBUG] Time slot "${timeSlot}" is in the past but entry is retrospective, keeping it as a past slot for today`);
+      const slotRange = this._parseTimeSlotRange(timeSlot);
+      if (slotRange) {
+        // Use the start hour and minute from the parsed range (already in 24-hour format)
+        // Create a new date using the same date as currentTime but with the slot's time
+        const slotStart = new Date(currentTime);
+        // Set to midnight UTC first, then add the hours/minutes
+        slotStart.setUTCFullYear(currentTime.getUTCFullYear(), currentTime.getUTCMonth(), currentTime.getUTCDate());
+        slotStart.setUTCHours(slotRange.startHour, slotRange.startMinute, 0, 0);
+        entryTime = slotStart;
+        console.log(`[DEBUG] Retrospective entry: using slot start ${slotRange.startHour}:${String(slotRange.startMinute).padStart(2, '0')} (${slotRange.startTime} minutes) as entry time for row matching`);
+      }
     }
 
     // Format timestamp
@@ -467,8 +890,8 @@ class JournalService {
       // Route entry to appropriate section based on context and timeSlot
       if (timeSlot) {
         // Time-specific activity -> Hourly Plan
-        console.log(`[DEBUG] Time slot exists, calling _insertEntryAtTimeSlot`);
-        await this._insertEntryAtTimeSlot(documentId, entryText, timeSlot, currentTime);
+        console.log(`[DEBUG] Time slot exists, calling _insertEntryAtTimeSlot with entryTime: ${entryTime.toISOString()}`);
+        await this._insertEntryAtTimeSlot(documentId, entryText, timeSlot, entryTime);
       } else if (detectedContext === 'note' || detectedContext?.toLowerCase() === 'note') {
         // Quick note -> Notes / Quick Logs section
         console.log(`[DEBUG] Context is note, inserting into Notes section`);
@@ -558,9 +981,10 @@ class JournalService {
   async _findAndInsertInTable(doc, documentId, entryText, timeSlot, entryTime) {
     const bodyContent = doc.data.body.content;
     
-    // Parse actual entry time (in minutes since midnight)
-    const entryTimeMinutes = entryTime.getHours() * 60 + entryTime.getMinutes();
-    console.log(`[DEBUG] Entry time: ${entryTime.getHours()}:${String(entryTime.getMinutes()).padStart(2, '0')} (${entryTimeMinutes} minutes since midnight)`);
+    // Parse actual entry time (in minutes since midnight UTC)
+    // Use UTC methods to avoid timezone issues
+    const entryTimeMinutes = entryTime.getUTCHours() * 60 + entryTime.getUTCMinutes();
+    console.log(`[DEBUG] Entry time: ${entryTime.getUTCHours()}:${String(entryTime.getUTCMinutes()).padStart(2, '0')} UTC (${entryTimeMinutes} minutes since midnight)`);
     console.log(`[DEBUG] Looking for time slot: "${timeSlot}"`);
     
     // Search for tables in document
@@ -667,29 +1091,58 @@ class JournalService {
           console.log(`[DEBUG] No matching rows found - will create new row`);
         }
 
-        // If matching row found, insert in Task Description cell (column 2)
+        // If matching row found, insert in Task Description cell (column 1, index 1)
         if (targetRowIndex >= 0 && targetRow) {
           console.log(`[DEBUG] Inserting into existing row ${targetRowIndex}`);
           const cells = targetRow.tableCells || [];
           
+          console.log(`[DEBUG] Row has ${cells.length} cells`);
+          
           if (cells.length >= 2) {
+            // Column 0 = Time Slot, Column 1 = Task Description
+            const timeSlotCell = cells[0];
             const taskCell = cells[1];
+            
+            // Debug: log cell indices to verify we're using the right cell
+            const timeSlotText = this._extractTextFromCell(timeSlotCell);
+            console.log(`[DEBUG] Time Slot cell (index 0): startIndex=${timeSlotCell.startIndex}, text="${timeSlotText}"`);
+            console.log(`[DEBUG] Task Description cell (index 1): startIndex=${taskCell.startIndex}`);
+            
             const cellContent = taskCell.content || [];
             let cellEndIndex = taskCell.startIndex || 0;
             
             // Calculate end index of cell
+            // For Google Docs, we need to find the end of the last paragraph in the cell
+            let insertIndex = taskCell.startIndex;
+            
             if (cellContent.length > 0) {
-              const lastElement = cellContent[cellContent.length - 1];
-              cellEndIndex = lastElement.endIndex || cellEndIndex;
+              // Find the last paragraph in the cell
+              for (let i = cellContent.length - 1; i >= 0; i--) {
+                const element = cellContent[i];
+                if (element.paragraph) {
+                  // Insert at the end of the last paragraph (before the newline)
+                  insertIndex = element.endIndex - 1;
+                  console.log(`[DEBUG] Task cell has content, found last paragraph endIndex=${element.endIndex}, inserting at ${insertIndex}`);
+                  break;
+                }
+              }
+              // If no paragraph found, use the last element's endIndex
+              if (insertIndex === taskCell.startIndex) {
+                const lastElement = cellContent[cellContent.length - 1];
+                insertIndex = lastElement.endIndex ? lastElement.endIndex - 1 : taskCell.startIndex + 1;
+                console.log(`[DEBUG] Task cell has content but no paragraph, using last element endIndex=${lastElement.endIndex}, inserting at ${insertIndex}`);
+              }
             } else {
-              cellEndIndex = taskCell.startIndex || 0;
+              // Empty cell - insert after the start index (after the newline that starts the cell)
+              insertIndex = taskCell.startIndex + 1;
+              console.log(`[DEBUG] Task cell is empty, using startIndex+1=${insertIndex}`);
             }
 
             // Prepare entry text (remove timestamp prefix since it's in cell context)
             const cleanEntryText = entryText.replace(/^•\s*\d{1,2}:\d{2}:\s*/, '').trim();
             const textToInsert = cleanEntryText ? `• ${cleanEntryText}\n` : entryText + '\n';
 
-            console.log(`[DEBUG] Inserting text at index ${cellEndIndex - 1}: "${textToInsert}"`);
+            console.log(`[DEBUG] Inserting text at index ${insertIndex} (Task Description cell, startIndex=${taskCell.startIndex}): "${textToInsert}"`);
 
             // Insert text into the cell
             await this.driveService.docs.documents.batchUpdate({
@@ -698,7 +1151,7 @@ class JournalService {
                 requests: [{
                   insertText: {
                     location: {
-                      index: cellEndIndex - 1
+                      index: insertIndex
                     },
                     text: textToInsert
                   }
@@ -820,6 +1273,7 @@ class JournalService {
         const timeCell = newCells[0];
         // Table cells always have a paragraph element starting at startIndex + 1
         const timeCellIndex = (timeCell.startIndex || 0) + 1;
+        console.log(`[DEBUG] Inserting time slot "${timeSlot}" at index ${timeCellIndex} (Time Slot cell, startIndex=${timeCell.startIndex})`);
         await this.driveService.docs.documents.batchUpdate({
           documentId,
           requestBody: {
@@ -833,25 +1287,75 @@ class JournalService {
         });
       }
 
+      // Refresh document after inserting time slot (indices shift)
+      const refreshedDoc = await this.driveService.docs.documents.get({ documentId });
+      const refreshedTable = refreshedDoc.data.body.content.find(el => 
+        el.table && el.startIndex === tableIndex
+      );
+
+      if (!refreshedTable || !refreshedTable.table) {
+        return { success: false, reason: 'table_not_found_after_time_slot_insertion' };
+      }
+
+      const refreshedRows = refreshedTable.table.tableRows || [];
+      if (refreshedRows.length <= targetRowIndex) {
+        return { success: false, reason: 'row_not_found_after_refresh' };
+      }
+
+      const refreshedRow = refreshedRows[targetRowIndex];
+      const refreshedCells = refreshedRow.tableCells || [];
+
       // Insert entry text in second cell (Task Description)
-      if (newCells.length > 1) {
-        const taskCell = newCells[1];
-        // Table cells always have a paragraph element starting at startIndex + 1
-        const taskCellIndex = (taskCell.startIndex || 0) + 1;
+      if (refreshedCells.length > 1) {
+        const taskCell = refreshedCells[1];
+        console.log(`[DEBUG] Task Description cell: startIndex=${taskCell.startIndex}`);
+        
+        // Use the same cell content inspection logic as existing row insertion
+        const cellContent = taskCell.content || [];
+        let insertIndex = taskCell.startIndex;
+        
+        if (cellContent.length > 0) {
+          // Find the last paragraph in the cell
+          for (let i = cellContent.length - 1; i >= 0; i--) {
+            const element = cellContent[i];
+            if (element.paragraph) {
+              // Insert at the end of the last paragraph (before the newline)
+              insertIndex = element.endIndex - 1;
+              console.log(`[DEBUG] Task cell has content, found last paragraph endIndex=${element.endIndex}, inserting at ${insertIndex}`);
+              break;
+            }
+          }
+          // If no paragraph found, use the last element's endIndex
+          if (insertIndex === taskCell.startIndex) {
+            const lastElement = cellContent[cellContent.length - 1];
+            insertIndex = lastElement.endIndex ? lastElement.endIndex - 1 : taskCell.startIndex + 1;
+            console.log(`[DEBUG] Task cell has content but no paragraph, using last element endIndex=${lastElement.endIndex}, inserting at ${insertIndex}`);
+          }
+        } else {
+          // Empty cell - insert after the start index (after the newline that starts the cell)
+          insertIndex = taskCell.startIndex + 1;
+          console.log(`[DEBUG] Task cell is empty, using startIndex+1=${insertIndex}`);
+        }
+
         const cleanEntryText = entryText.replace(/^•\s*\d{1,2}:\d{2}:\s*/, '').trim();
         const textToInsert = cleanEntryText ? `• ${cleanEntryText}\n` : entryText + '\n';
+
+        console.log(`[DEBUG] Inserting entry text at index ${insertIndex} (Task Description cell, startIndex=${taskCell.startIndex}): "${textToInsert}"`);
 
         await this.driveService.docs.documents.batchUpdate({
           documentId,
           requestBody: {
             requests: [{
               insertText: {
-                location: { index: taskCellIndex },
+                location: { index: insertIndex },
                 text: textToInsert
               }
             }]
           }
         });
+      } else {
+        console.log(`[DEBUG] Refreshed row has only ${refreshedCells.length} cells, need at least 2`);
+        return { success: false, reason: 'insufficient_cells_after_refresh' };
       }
 
       return { success: true };
@@ -1117,46 +1621,68 @@ class JournalService {
    * @returns {Object|null} Object with startTime and endTime (minutes since midnight) or null
    */
   _parseTimeSlotRange(timeSlot) {
-    // Match 12-hour format: "3:30 - 4:30 PM" or "03:00-05:30PM"
-    const match12 = timeSlot.match(/(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    // Match 12-hour format: "3:30 - 4:30 PM" or "03:00-05:30PM" or "12:00-1:00 PM" or "11:00AM - 12:00 PM"
+    // More flexible: allows optional spaces around dash, optional space before AM/PM
+    // Also handles "11:00AM" format (no space before AM)
+    const match12 = timeSlot.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
     if (match12) {
       let startHour = parseInt(match12[1], 10);
       const startMinute = parseInt(match12[2], 10);
-      let endHour = parseInt(match12[3], 10);
-      const endMinute = parseInt(match12[4], 10);
-      const ampm = match12[5].toUpperCase();
+      const startAMPM = match12[3] ? match12[3].toUpperCase() : null; // Optional start AM/PM
+      let endHour = parseInt(match12[4], 10);
+      const endMinute = parseInt(match12[5], 10);
+      const endAMPM = match12[6].toUpperCase(); // Required end AM/PM
       
       // Store original endHour before conversion for wrap detection
       const originalEndHour = endHour;
       
-      // Handle AM/PM for start time
-      if (ampm === 'PM' && startHour !== 12) startHour += 12;
-      if (ampm === 'AM' && startHour === 12) startHour = 0;
+      // Handle AM/PM for start time (use startAMPM if provided, otherwise use endAMPM)
+      const startAMPMToUse = startAMPM || endAMPM;
+      if (startAMPMToUse === 'PM' && startHour !== 12) startHour += 12;
+      if (startAMPMToUse === 'AM' && startHour === 12) startHour = 0;
       
-      // Handle AM/PM for end time
-      // Both start and end times share the same AM/PM indicator
-      // If original end hour is less than original start hour, it's next day (e.g., 11:30 PM - 1:00 AM)
-      if (originalEndHour < parseInt(match12[1], 10)) {
-        // Time wraps to next day
-        if (ampm === 'PM') {
-          // End time is next day (AM), so don't add 12
-          // endHour stays as is (1, 2, 3, etc.)
-        } else {
-          // AM wrap: endHour is next day PM, so add 12
+      // Handle AM/PM for end time (use endAMPM)
+      let endHour24 = endHour;
+      if (endAMPM === 'PM' && endHour24 !== 12) endHour24 += 12;
+      if (endAMPM === 'AM' && endHour24 === 12) endHour24 = 0;
+      
+      // Check if time wraps to next day by comparing converted hours
+      // If end hour (converted) is less than start hour (converted), it wraps
+      // Exception: "12:00 - 1:00 AM" (0 to 1) is same day, not a wrap
+      const ampmForWrap = startAMPM || endAMPM; // Use for wrap detection
+      if (endHour24 < startHour && !(startHour === 0 && endHour24 === 1 && ampmForWrap === 'AM')) {
+        // Time wraps to next day - add 24 hours to end
+        endHour24 += 24;
+      }
+      
+      endHour = endHour24;
+      
+      // Fix: Handle edge case where endTime wraps incorrectly
+      // If endTime is less than startTime and we're not in a wrap scenario, fix it
+      let endTimeMinutes = endHour * 60 + endMinute;
+      const startTimeMinutes = startHour * 60 + startMinute;
+      
+      // Critical fix: If end time is less than start time for same-day PM slots, 
+      // the end hour conversion didn't happen correctly
+      if (endTimeMinutes < startTimeMinutes && originalEndHour >= parseInt(match12[1], 10)) {
+        // Same day slot but end < start means end hour wasn't converted properly
+        // Re-apply PM conversion if needed
+        if (endAMPM === 'PM' && endHour !== 12 && endHour < 12) {
           endHour += 12;
-        }
-      } else {
-        // Same day - apply AM/PM conversion (same as start time)
-        if (ampm === 'PM' && endHour !== 12) {
-          endHour += 12;
-        } else if (ampm === 'AM' && endHour === 12) {
-          endHour = 0;
+          endTimeMinutes = endHour * 60 + endMinute;
         }
       }
       
+      // Additional safety check: if we're in PM and endHour is 1-11, it should be 13-23
+      if (endAMPM === 'PM' && endHour >= 1 && endHour <= 11 && originalEndHour >= parseInt(match12[1], 10)) {
+        // End hour should be PM, so add 12
+        endHour += 12;
+        endTimeMinutes = endHour * 60 + endMinute;
+      }
+      
       return {
-        startTime: startHour * 60 + startMinute,
-        endTime: endHour * 60 + endMinute,
+        startTime: startTimeMinutes,
+        endTime: endTimeMinutes,
         startHour,
         startMinute,
         endHour,

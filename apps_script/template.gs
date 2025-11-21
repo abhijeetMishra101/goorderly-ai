@@ -78,6 +78,10 @@ function createDailyJournalAndCalendarEvent() {
   const newDocUrl = newDoc.getUrl();
   const newDocId = newDoc.getId();
 
+  // Replace {DATE} placeholder in document body
+  const body = DocumentApp.openById(newDocId).getBody();
+  body.replaceText('\\{DATE\\}', today);
+
   // Save the new doc ID and date for checks
   const props = PropertiesService.getScriptProperties();
   props.setProperty(PROP_TODAY_DOC_ID, newDocId);
