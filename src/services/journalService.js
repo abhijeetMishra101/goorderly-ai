@@ -803,8 +803,35 @@ class JournalService {
     const detectedContext = context || extractedData.context || detectContext(text);
     let timeSlot = extractedData.timeSlot;
     
+    // Extract person mention data
+    const mentionedPersons = extractedData.mentionedPersons || [];
+    const sentiment = extractedData.sentiment || 'neutral';
+    const inferredHashtags = extractedData.inferredHashtags || [];
+    
+    // Determine default actions: prioritize journal if person mentions exist
+    // Only use timeSlot if time was explicitly mentioned (not inferred)
+    let actions = extractedData.actions;
+    if (!actions || actions.length === 0) {
+      const hasExplicitTime = extractedData.hasExplicitTime === true;
+      if (mentionedPersons.length > 0) {
+        // Person mentions detected -> journal action (unless time was explicitly mentioned)
+        actions = hasExplicitTime && timeSlot ? ['timeSlot', 'journal'] : ['journal'];
+      } else if (timeSlot && hasExplicitTime) {
+        // Explicit time mentioned -> timeSlot action
+        actions = ['timeSlot'];
+      } else {
+        // Default to journal for general entries
+        actions = ['journal'];
+      }
+    }
+    
+    const journalEntry = extractedData.journalEntry || null;
+    
     console.log(`[DEBUG] Detected context: ${detectedContext}`);
     console.log(`[DEBUG] Time slot: ${timeSlot ? `"${timeSlot}"` : 'null/undefined'}`);
+    console.log(`[DEBUG] Mentioned persons: ${mentionedPersons.join(', ') || 'none'}`);
+    console.log(`[DEBUG] Sentiment: ${sentiment}`);
+    console.log(`[DEBUG] Actions: ${actions.join(', ')}`);
 
     // Initialize entryTime to current time (will be adjusted for retrospective entries)
     let entryTime = currentTime;
@@ -871,7 +898,7 @@ class JournalService {
       hour12: false 
     });
 
-    // Build entry text
+    // Build entry text for time slot (if needed)
     let entryText = `• ${timeStr}: ${text}`;
 
     // Add geo-tagging if coordinates provided
@@ -887,27 +914,104 @@ class JournalService {
     console.log(`[DEBUG] Final entry text: "${entryText}"`);
 
     try {
-      // Route entry to appropriate section based on context and timeSlot
-      if (timeSlot) {
-        // Time-specific activity -> Hourly Plan
-        console.log(`[DEBUG] Time slot exists, calling _insertEntryAtTimeSlot with entryTime: ${entryTime.toISOString()}`);
+      // Handle multiple actions (e.g., both timeSlot and journal)
+      const hasTimeSlotAction = actions.includes('timeSlot');
+      const hasJournalAction = actions.includes('journal');
+      
+      // Build journal entry text with person hashtags and date/time hashtags
+      let journalEntryText = null;
+      if (hasJournalAction) {
+        if (journalEntry) {
+          // Use LLM-generated journal entry if available
+          journalEntryText = journalEntry;
+        } else {
+          // Build journal entry from scratch
+          const dateHashtag = `#${formatDateForHashtag(currentTime)}`;
+          const timeHashtag = `#${currentTime.toLocaleTimeString('en-US', { 
+            hour: '2-digit', 
+            minute: '2-digit',
+            hour12: true 
+          }).replace(/\s/g, '')}`; // e.g., "11:30PM"
+          
+          // Build hashtags array
+          const hashtags = [dateHashtag, timeHashtag];
+          
+          // Add person hashtags
+          mentionedPersons.forEach(person => {
+            hashtags.push(`#${person}`);
+          });
+          
+          // Add sentiment hashtag
+          if (sentiment !== 'neutral') {
+            hashtags.push(`#${sentiment}`);
+          }
+          
+          // Add inferred hashtags
+          inferredHashtags.forEach(tag => {
+            // Remove # if already present
+            const cleanTag = tag.startsWith('#') ? tag : `#${tag}`;
+            hashtags.push(cleanTag);
+          });
+          
+          // Build journal entry text
+          journalEntryText = `${text} ${hashtags.join(' ')}`;
+        }
+      }
+      
+      // Process time slot action
+      if (hasTimeSlotAction && timeSlot) {
+        console.log(`[DEBUG] Time slot action: inserting into time slot "${timeSlot}"`);
         await this._insertEntryAtTimeSlot(documentId, entryText, timeSlot, entryTime);
-      } else if (detectedContext === 'note' || detectedContext?.toLowerCase() === 'note') {
-        // Quick note -> Notes / Quick Logs section
-        console.log(`[DEBUG] Context is note, inserting into Notes section`);
-        await this.driveService.insertIntoNotes(documentId, entryText);
-      } else if (detectedContext === 'journal' || detectedContext?.toLowerCase() === 'journal' || text.includes('#')) {
-        // Journal entry with hashtags -> Free-form Journal section
-        console.log(`[DEBUG] Context is journal or has hashtags, inserting into Free-form Journal`);
-        await this.driveService.insertIntoJournal(documentId, entryText);
-      } else if (detectedContext && (detectedContext.includes('office') || detectedContext.includes('personal') || detectedContext.includes('health'))) {
-        // Task with tags -> To-Do List
-        console.log(`[DEBUG] Context has task tags, inserting into To-Do List`);
-        await this.driveService.insertIntoToDoList(documentId, entryText);
-      } else {
-        // Fallback -> append at end
-        console.log(`[DEBUG] No specific section match - appending at end`);
-        await this.driveService.appendToDocument(documentId, entryText);
+      }
+      
+      // Process journal action
+      if (hasJournalAction && journalEntryText) {
+        console.log(`[DEBUG] Journal action: inserting into Free-form Journal`);
+        await this.driveService.insertIntoJournal(documentId, journalEntryText);
+      }
+      
+      // If no specific actions, fall back to original routing logic
+      // But prioritize journal if person mentions exist
+      if (!hasTimeSlotAction && !hasJournalAction) {
+        if (mentionedPersons.length > 0) {
+          // Person mentions detected but no actions -> create journal entry with hashtags
+          console.log(`[DEBUG] Person mentions detected but no actions specified, creating journal entry`);
+          const dateHashtag = `#${formatDateForHashtag(currentTime)}`;
+          const timeHashtag = `#${currentTime.toLocaleTimeString('en-US', { 
+            hour: '2-digit', 
+            minute: '2-digit',
+            hour12: true 
+          }).replace(/\s/g, '')}`;
+          const hashtags = [dateHashtag, timeHashtag];
+          mentionedPersons.forEach(person => hashtags.push(`#${person}`));
+          if (sentiment !== 'neutral') hashtags.push(`#${sentiment}`);
+          inferredHashtags.forEach(tag => {
+            const cleanTag = tag.startsWith('#') ? tag : `#${tag}`;
+            hashtags.push(cleanTag);
+          });
+          const journalText = `${text} ${hashtags.join(' ')}`;
+          await this.driveService.insertIntoJournal(documentId, journalText);
+        } else if (timeSlot && hasExplicitTime) {
+          // Time-specific activity -> Hourly Plan
+          console.log(`[DEBUG] Time slot exists, calling _insertEntryAtTimeSlot with entryTime: ${entryTime.toISOString()}`);
+          await this._insertEntryAtTimeSlot(documentId, entryText, timeSlot, entryTime);
+        } else if (detectedContext === 'note' || detectedContext?.toLowerCase() === 'note') {
+          // Quick note -> Notes / Quick Logs section
+          console.log(`[DEBUG] Context is note, inserting into Notes section`);
+          await this.driveService.insertIntoNotes(documentId, entryText);
+        } else if (detectedContext === 'journal' || detectedContext?.toLowerCase() === 'journal' || text.includes('#')) {
+          // Journal entry with hashtags -> Free-form Journal section
+          console.log(`[DEBUG] Context is journal or has hashtags, inserting into Free-form Journal`);
+          await this.driveService.insertIntoJournal(documentId, entryText);
+        } else if (detectedContext && (detectedContext.includes('office') || detectedContext.includes('personal') || detectedContext.includes('health'))) {
+          // Task with tags -> To-Do List
+          console.log(`[DEBUG] Context has task tags, inserting into To-Do List`);
+          await this.driveService.insertIntoToDoList(documentId, entryText);
+        } else {
+          // Fallback -> append at end
+          console.log(`[DEBUG] No specific section match - appending at end`);
+          await this.driveService.appendToDocument(documentId, entryText);
+        }
       }
 
       return {
@@ -915,6 +1019,11 @@ class JournalService {
         isReminder: false,
         context: detectedContext,
         timeSlot: timeSlot || null,
+        mentionedPersons: mentionedPersons,
+        sentiment: sentiment,
+        inferredHashtags: inferredHashtags,
+        actions: actions,
+        journalEntry: journalEntryText,
         usedLLM: extractedData.usedLLM || false
       };
     } catch (error) {

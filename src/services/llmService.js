@@ -124,7 +124,40 @@ Template structure:
 - ⏰ Hourly Plan (time slots: 12:00-1:00 AM, 1:00-2:00 AM, ..., 11:00 PM-12:00 AM)
 - 📋 To-Do List (for tasks with #office #personal #health tags)
 - 🧠 Notes / Quick Logs (for quick notes)
-- 📝 Free-form Journal (for longer entries with #hashtags)
+- 📝 Free-form Journal (for longer entries with #hashtags, person mentions, observations, rants)
+
+PERSON MENTION DETECTION:
+- Detect if the entry mentions people (names like "Sumit", "Rohit", "John", etc.)
+- Infer sentiment: positive, negative, or neutral
+- Infer context: observation, rant, task, meeting, etc.
+- If person is mentioned, create a journal entry with hashtags: #PersonName #date #sentiment #context
+
+INFERRED HASHTAGS (IMPORTANT - Always infer relevant hashtags):
+- Infer relevant context hashtags based on entry content and meaning
+- Examples of hashtags to infer:
+  * Optimism/Hope: "will work", "going to", "hope", "excited", "confident", "believe" → #optimism
+  * Achievement: "completed", "finished", "done", "accomplished", "achieved" → #achievement
+  * Planning: "plan", "schedule", "organize", "preparing" → #planning
+  * Reflection: "think", "realize", "understand", "insight", "reflecting" → #reflection
+  * Observation: "noticed", "saw", "observed", "seeing" → #observation
+  * Rant/Venting: "hate", "annoying", "frustrating", "can't stand" → #rant
+  * Gratitude: "thankful", "grateful", "appreciate", "thanks" → #gratitude
+  * Motivation: "motivated", "inspired", "determined", "focused" → #motivation
+  * Stress: "stressed", "overwhelmed", "pressure", "too much" → #stress
+  * Learning: "study", "learn", "reading", "research", "practicing" → #learning
+  * Relaxation: "weekend", "relax", "rest", "break", "vacation" → #relaxation
+  * Work: "work", "productive", "focus", "deep work" → #work
+  * Health: "exercise", "gym", "workout", "health", "fitness" → #health
+  * Social: "friend", "family", "meeting", "party", "social" → #social
+  * Creative: "creative", "art", "design", "writing", "music" → #creative
+- Add multiple hashtags if entry contains multiple contexts or themes
+- Be creative and infer hashtags that capture the essence, mood, or theme of the entry
+- Don't just match keywords - understand the meaning and infer appropriate hashtags
+
+MULTIPLE ACTIONS:
+- An entry can require multiple actions (e.g., both timeSlot AND journal)
+- Example: "Rohit has scheduled a call for 11:30PM today" → timeSlot: "11:00 PM-12:00 AM" AND journal entry about Rohit
+- Use "actions" array: ["timeSlot", "journal"] or ["reminder", "journal"] or ["timeSlot"] or ["journal"]
 
 IMPORTANT - Time Reference Intelligence:
 - If user mentions a time like "7 o'clock", "7 AM", "7 PM", "at 3", etc., determine the NEXT UPCOMING occurrence:
@@ -136,7 +169,7 @@ IMPORTANT - Time Reference Intelligence:
     - Use context clues (e.g., "drop to school" suggests morning/AM, "dinner" suggests evening/PM)
 
 Is this a REMINDER? If yes, return JSON:
-{"isReminder":true,"task":"...","targetDate":"YYYY-MM-DD","targetTime":"HH:MM"}
+{"isReminder":true,"task":"...","targetDate":"YYYY-MM-DD","targetTime":"HH:MM","mentionedPersons":[],"sentiment":"neutral","inferredHashtags":[],"actions":["reminder"]}
 
 If no, determine where to place entry:
 - For time-specific activities: use "timeSlot" (e.g., "7:00-8:00 AM", "7:00-8:00 PM", "2:00-3:00 PM")
@@ -146,8 +179,26 @@ If no, determine where to place entry:
 - For quick notes: use "context":"note"
 - For journal entries: use "context":"journal" and include #hashtags in "action"
 
-Return JSON:
-{"isReminder":false,"timeSlot":"...","context":"...","location":"...","action":"..."}
+Return JSON with ALL fields:
+{
+  "isReminder":false,
+  "timeSlot":"...",
+  "context":"...",
+  "location":"...",
+  "action":"...",
+  "mentionedPersons":["PersonName1","PersonName2"],
+  "sentiment":"positive|negative|neutral",
+  "inferredHashtags":["#hashtag1","#hashtag2"],
+  "actions":["timeSlot","journal"],
+  "journalEntry":"Formatted text for free-form journal with hashtags (if applicable)"
+}
+
+Fields:
+- mentionedPersons: array of person names detected (empty array if none)
+- sentiment: "positive", "negative", or "neutral"
+- inferredHashtags: array of context hashtags (e.g., ["#observation", "#rant", "#meeting"])
+- actions: array of actions to take (e.g., ["timeSlot", "journal"] or ["reminder", "journal"] or ["timeSlot"] or ["journal"])
+- journalEntry: formatted text for free-form journal (only if actions includes "journal")
 
 JSON only:`;
   }
@@ -176,6 +227,11 @@ JSON only:`;
           targetTime: parsed.targetTime || null,
           timeSlot: parsed.timeSlot || null,
           context: parsed.context || null,
+          mentionedPersons: parsed.mentionedPersons || [],
+          sentiment: parsed.sentiment || 'neutral',
+          inferredHashtags: parsed.inferredHashtags || [],
+          actions: parsed.actions || ['reminder'],
+          journalEntry: parsed.journalEntry || null,
           usedLLM: true
         };
       }
@@ -191,6 +247,11 @@ JSON only:`;
         context: parsed.context || null,
         location: parsed.location || null,
         action: parsed.action || '',
+        mentionedPersons: parsed.mentionedPersons || [],
+        sentiment: parsed.sentiment || 'neutral',
+        inferredHashtags: parsed.inferredHashtags || [],
+        actions: parsed.actions || (parsed.timeSlot ? ['timeSlot'] : ['journal']),
+        journalEntry: parsed.journalEntry || null,
         usedLLM: true
       };
     } catch (error) {

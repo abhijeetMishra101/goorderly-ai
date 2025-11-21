@@ -45,7 +45,12 @@ function createJournalRoutes() {
         timeSlot: result.timeSlot || null,
         targetDate: result.targetDate || null,
         targetTime: result.targetTime || null,
-        convertedFromTimeSlot: result.convertedFromTimeSlot || false
+        convertedFromTimeSlot: result.convertedFromTimeSlot || false,
+        mentionedPersons: result.mentionedPersons || [],
+        sentiment: result.sentiment || 'neutral',
+        inferredHashtags: result.inferredHashtags || [],
+        actions: result.actions || [],
+        journalEntry: result.journalEntry || null
       });
     } catch (error) {
       res.status(500).json({

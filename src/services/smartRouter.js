@@ -25,16 +25,6 @@ class SmartRouter {
     // Step 1: Try simple detection first (regex/rules)
     const simpleResult = this._trySimpleDetection(text, context.currentTime);
 
-    // If confidence is high enough, use regex result (no LLM call)
-    // Lowered threshold from 0.8 to 0.5 to avoid LLM calls for more entries
-    // This reduces timeout issues when LLM is slow or unavailable
-    if (simpleResult.confidence >= 0.5) {
-      return {
-        ...simpleResult,
-        usedLLM: false
-      };
-    }
-
     // For reminders detected by simple detection, skip LLM if we have basic info
     // This avoids slow LLM calls for simple "remind me tomorrow" cases
     if (simpleResult.isReminder && simpleResult.task && simpleResult.targetDate) {
@@ -45,33 +35,65 @@ class SmartRouter {
       };
     }
 
-    // Step 2: Use LLM for ambiguous/complex entries (with timeout)
+    // Step 2: Always try LLM for better hashtag inference (even if simple detection has high confidence)
+    // This allows LLM to add more nuanced hashtags beyond regex patterns
+    let llmResult = null;
+    let llmError = null;
+    
     try {
-      const llmResult = await Promise.race([
+      llmResult = await Promise.race([
         this.llmService.extractVoiceEntry(text, context),
         new Promise((_, reject) => 
           setTimeout(() => reject(new Error('LLM timeout')), 6000) // 6s timeout for faster failure
         )
       ]);
-      return {
-        ...llmResult,
-        usedLLM: true
-      };
     } catch (error) {
-      // Fallback to simple detection if LLM fails or times out
+      // LLM failed or timed out - we'll use simple detection result
+      llmError = error;
       const errorType = error.message.includes('timeout') ? 'timeout' : 
                        error.message.includes('unavailable') ? 'unavailable' : 'error';
-      console.warn(`[SmartRouter] LLM extraction failed (${errorType}), using fallback:`, error.message);
-      
-      // If LLM is unavailable, log it but don't spam
       if (errorType === 'unavailable') {
-        console.warn('[SmartRouter] LLM service appears to be down. Using simple detection for all entries.');
+        console.warn('[SmartRouter] LLM service unavailable, using simple detection only');
+      }
+    }
+
+    // Step 3: Merge results - use LLM if available, otherwise use simple detection
+    if (llmResult) {
+      // Merge regex hashtags from simple detection with LLM hashtags
+      const regexHashtags = simpleResult.inferredHashtags || [];
+      const llmHashtags = llmResult.inferredHashtags || [];
+      
+      // Combine and deduplicate hashtags (remove # prefix for comparison)
+      const allHashtags = [...regexHashtags, ...llmHashtags];
+      const uniqueHashtags = [...new Set(allHashtags.map(tag => tag.replace(/^#/, '').toLowerCase()))]
+        .map(tag => {
+          // Preserve original case from LLM if available, otherwise use regex case
+          const llmTag = llmHashtags.find(t => t.replace(/^#/, '').toLowerCase() === tag);
+          const regexTag = regexHashtags.find(t => t.replace(/^#/, '').toLowerCase() === tag);
+          return llmTag || regexTag || `#${tag}`;
+        });
+      
+      return {
+        ...llmResult,
+        inferredHashtags: uniqueHashtags,
+        usedLLM: true
+      };
+    } else {
+      // LLM failed or timed out - use simple detection result
+      // If confidence is high enough, return simple result
+      if (simpleResult.confidence >= 0.5) {
+        return {
+          ...simpleResult,
+          usedLLM: false,
+          error: llmError?.message
+        };
       }
       
+      // Low confidence but LLM failed - still return simple result
       return {
         ...simpleResult,
         usedLLM: false,
-        error: error.message
+        error: llmError?.message
       };
     }
   }
@@ -117,7 +139,12 @@ class SmartRouter {
         confidence: 0.2, // Low confidence - force LLM for date parsing
         task: task, // Basic task extraction for fallback
         targetDate: tomorrowMatch ? tomorrowDate : null, // If "tomorrow" mentioned, use it as fallback
-        action: text
+        action: text,
+        mentionedPersons: [],
+        sentiment: 'neutral',
+        inferredHashtags: [],
+        actions: ['reminder'],
+        journalEntry: null
       };
     }
 
@@ -154,9 +181,27 @@ class SmartRouter {
       confidence = 0.95; // Very high confidence
     }
 
-    // Use detected time reference if found, otherwise infer from current time
-    const timeSlot = timeReference || this._inferTimeSlot(currentTime || new Date());
+    // Try to detect person mentions first (before inferring time slot)
+    const personMentions = [];
+    const personPattern = /\b([A-Z][a-z]+)\b/g; // Simple: capitalized words (names)
+    const matches = text.match(personPattern);
+    if (matches) {
+      // Filter out common words that aren't names
+      const commonWords = ['I', 'The', 'This', 'That', 'There', 'Here', 'Today', 'Tomorrow', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      personMentions.push(...matches.filter(m => !commonWords.includes(m)));
+    }
+    
     const hasExplicitTime = !!timeReference; // Track if time was explicitly mentioned
+    
+    // Use detected time reference if found
+    // Only infer from current time if:
+    // 1. No explicit time reference AND
+    // 2. No person mentions (person mentions should go to journal, not time slot)
+    let timeSlot = timeReference;
+    if (!timeSlot && personMentions.length === 0) {
+      // No person mentions and no explicit time -> infer from current time
+      timeSlot = this._inferTimeSlot(currentTime || new Date());
+    }
     
     // If we detected a time reference, increase confidence
     if (timeReference) {
@@ -169,6 +214,103 @@ class SmartRouter {
       confidence = 0.65; // Medium-high confidence for short generic entries
     }
 
+    // Basic sentiment detection (very simple)
+    let sentiment = 'neutral';
+    if (/\b(good|great|awesome|excellent|happy|pleased|love|like)\b/.test(lowerText)) {
+      sentiment = 'positive';
+    } else if (/\b(bad|terrible|awful|hate|dislike|annoyed|frustrated|angry|sad|upset|lame)\b/.test(lowerText)) {
+      sentiment = 'negative';
+    }
+    
+    // Infer additional context hashtags (lightweight regex patterns)
+    const inferredHashtags = [];
+    
+    // Optimism/Hope
+    if (/\b(will work|going to work|hope|hoping|excited|looking forward|optimistic|optimism|confident|believe)\b/.test(lowerText)) {
+      inferredHashtags.push('optimism');
+    }
+    
+    // Achievement/Completion
+    if (/\b(completed|finished|done|accomplished|achieved|succeeded)\b/.test(lowerText)) {
+      inferredHashtags.push('achievement');
+    }
+    
+    // Planning/Organization
+    if (/\b(plan|planning|schedule|organize|organizing|preparing|prep)\b/.test(lowerText)) {
+      inferredHashtags.push('planning');
+    }
+    
+    // Reflection/Insight
+    if (/\b(think|thinking|realize|realized|understand|understood|insight|reflection|reflecting)\b/.test(lowerText)) {
+      inferredHashtags.push('reflection');
+    }
+    
+    // Observation
+    if (/\b(noticed|saw|observed|seeing|watching|noticing)\b/.test(lowerText)) {
+      inferredHashtags.push('observation');
+    }
+    
+    // Rant/Venting
+    if (/\b(hate|can't stand|cannot stand|so annoying|so frustrating|ugh|seriously|really annoying)\b/.test(lowerText)) {
+      inferredHashtags.push('rant');
+    }
+    
+    // Gratitude
+    if (/\b(thankful|grateful|appreciate|appreciating|thanks|thank you)\b/.test(lowerText)) {
+      inferredHashtags.push('gratitude');
+    }
+    
+    // Motivation/Determination
+    if (/\b(motivated|inspired|determined|focused|committed|driven|pumped)\b/.test(lowerText)) {
+      inferredHashtags.push('motivation');
+    }
+    
+    // Stress/Overwhelm
+    if (/\b(stressed|overwhelmed|too much|can't handle|overloaded|pressure)\b/.test(lowerText)) {
+      inferredHashtags.push('stress');
+    }
+    
+    // Learning/Study
+    if (/\b(study|studying|learn|learning|reading|read|research|practicing|practice)\b/.test(lowerText)) {
+      inferredHashtags.push('learning');
+    }
+    
+    // Weekend/Relaxation
+    if (/\b(weekend|relax|relaxing|rest|resting|break|vacation|holiday)\b/.test(lowerText)) {
+      inferredHashtags.push('relaxation');
+    }
+    
+    // Work/Productivity
+    if (/\b(work|working|productive|productivity|focus|focused|deep work)\b/.test(lowerText)) {
+      inferredHashtags.push('work');
+    }
+    
+    // Determine actions based on what we detected
+    // Priority: If person mentions exist and time was NOT explicitly mentioned, use journal only
+    const actions = [];
+    if (personMentions.length > 0 && !hasExplicitTime) {
+      // Person mentions without explicit time -> journal only (not time slot)
+      actions.push('journal');
+    } else {
+      // Normal routing logic
+      if (timeSlot && hasExplicitTime) {
+        // Explicit time mentioned -> include timeSlot
+        actions.push('timeSlot');
+      }
+      if (personMentions.length > 0 || detectedContext === 'journal' || text.includes('#')) {
+        // Person mentions or journal context -> include journal
+        actions.push('journal');
+      }
+    }
+    if (actions.length === 0) {
+      // Default action based on context
+      if (detectedContext === 'note') {
+        actions.push('note');
+      } else {
+        actions.push('journal');
+      }
+    }
+    
     return {
       isReminder: false,
       context: detectedContext,
@@ -176,7 +318,12 @@ class SmartRouter {
       hasExplicitTime, // Flag to indicate if time was explicitly mentioned
       isRetrospective,
       confidence,
-      action: text
+      action: text,
+      mentionedPersons: personMentions,
+      sentiment: sentiment,
+      inferredHashtags: inferredHashtags,
+      actions: actions,
+      journalEntry: null
     };
   }
 

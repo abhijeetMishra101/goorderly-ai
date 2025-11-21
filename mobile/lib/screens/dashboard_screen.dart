@@ -507,6 +507,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final timeSlot = _lastVoiceEntryResult!['timeSlot'] as String?;
     final targetDate = _lastVoiceEntryResult!['targetDate'] as String?;
     final targetTime = _lastVoiceEntryResult!['targetTime'] as String?;
+    final mentionedPersons = _lastVoiceEntryResult!['mentionedPersons'] as List<dynamic>? ?? [];
+    final actions = _lastVoiceEntryResult!['actions'] as List<dynamic>? ?? [];
+    final sentiment = _lastVoiceEntryResult!['sentiment'] as String? ?? 'neutral';
+
+    // Build announcement parts
+    final announcementParts = <String>[];
 
     // If it's a reminder (including converted from time slot)
     if (isReminder) {
@@ -527,17 +533,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
         final timeStr = minute > 0 ? '$hour12:${minute.toString().padLeft(2, '0')} $ampm' : '$hour12 $ampm';
         
         if (isToday) {
-          return "Reminder set for $timeStr today";
+          announcementParts.add("Reminder set for $timeStr today");
         } else {
-          return "Reminder set for $timeStr tomorrow";
+          announcementParts.add("Reminder set for $timeStr tomorrow");
         }
       } else {
-        return "Reminder created";
+        announcementParts.add("Reminder created");
       }
     }
     
-    // If it has a time slot (scheduled for today)
-    if (timeSlot != null) {
+    // Handle time slot action
+    if (timeSlot != null && (actions.isEmpty || actions.contains('timeSlot'))) {
       // Extract time from time slot (e.g., "7:00 - 8:00 AM" -> "7 AM")
       final timeMatch = RegExp(r'(\d{1,2}):(\d{2})\s*-\s*\d{1,2}:\d{2}\s*(AM|PM)', caseSensitive: false)
           .firstMatch(timeSlot);
@@ -547,9 +553,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
         final ampm = timeMatch.group(3)!.toUpperCase();
         final hour12 = hour > 12 ? hour - 12 : (hour == 0 ? 12 : hour);
         final timeStr = minute > 0 ? '$hour12:$minute $ampm' : '$hour12 $ampm';
-        return "Note created for $timeStr today";
+        announcementParts.add("Added to $timeStr time slot");
+      } else {
+        announcementParts.add("Note scheduled for $timeSlot");
       }
-      return "Note scheduled for $timeSlot";
+    }
+    
+    // Handle journal action with person mentions
+    if (actions.contains('journal') || mentionedPersons.isNotEmpty) {
+      if (mentionedPersons.isNotEmpty) {
+        final personNames = mentionedPersons.join(' and ');
+        final sentimentText = sentiment == 'positive' ? 'positive note' : 
+                             sentiment == 'negative' ? 'note' : 'note';
+        announcementParts.add("Noted about $personNames in journal");
+      } else {
+        announcementParts.add("Added to journal");
+      }
+    }
+    
+    // Combine announcement parts
+    if (announcementParts.isNotEmpty) {
+      return announcementParts.join(' and ');
     }
     
     // Default fallback
