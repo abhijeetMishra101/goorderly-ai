@@ -503,6 +503,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       return "Making a note of it right away";
     }
 
+    final isAnalysisRequest = _lastVoiceEntryResult!['isAnalysisRequest'] as bool? ?? false;
     final isReminder = _lastVoiceEntryResult!['isReminder'] as bool? ?? false;
     final timeSlot = _lastVoiceEntryResult!['timeSlot'] as String?;
     final targetDate = _lastVoiceEntryResult!['targetDate'] as String?;
@@ -510,6 +511,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final mentionedPersons = _lastVoiceEntryResult!['mentionedPersons'] as List<dynamic>? ?? [];
     final actions = _lastVoiceEntryResult!['actions'] as List<dynamic>? ?? [];
     final sentiment = _lastVoiceEntryResult!['sentiment'] as String? ?? 'neutral';
+
+    // Handle analysis request
+    if (isAnalysisRequest) {
+      return "Day analysis completed. Check your journal for insights.";
+    }
 
     // Build announcement parts
     final announcementParts = <String>[];

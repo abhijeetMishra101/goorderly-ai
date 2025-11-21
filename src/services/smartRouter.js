@@ -25,6 +25,15 @@ class SmartRouter {
     // Step 1: Try simple detection first (regex/rules)
     const simpleResult = this._trySimpleDetection(text, context.currentTime);
 
+    // If analysis request detected, return immediately
+    if (simpleResult.isAnalysisRequest === true) {
+      console.log('[SmartRouter] Analysis request detected');
+      return {
+        ...simpleResult,
+        usedLLM: false
+      };
+    }
+
     // For reminders detected by simple detection, skip LLM if we have basic info
     // This avoids slow LLM calls for simple "remind me tomorrow" cases
     if (simpleResult.isReminder && simpleResult.task && simpleResult.targetDate) {
@@ -59,6 +68,14 @@ class SmartRouter {
 
     // Step 3: Merge results - use LLM if available, otherwise use simple detection
     if (llmResult) {
+      // If LLM detected analysis request, return it directly
+      if (llmResult.isAnalysisRequest === true) {
+        return {
+          ...llmResult,
+          usedLLM: true
+        };
+      }
+      
       // Merge regex hashtags from simple detection with LLM hashtags
       const regexHashtags = simpleResult.inferredHashtags || [];
       const llmHashtags = llmResult.inferredHashtags || [];
@@ -106,6 +123,26 @@ class SmartRouter {
    */
   _trySimpleDetection(text, currentTime) {
     const lowerText = text.toLowerCase();
+
+    // Detect analysis request
+    const analysisPatterns = [
+      /perform analysis (of|for) (my )?day/i,
+      /analyze (my )?day/i,
+      /analysis (of|for) (my )?day/i,
+      /end of day analysis/i,
+      /analyze today/i,
+      /day analysis/i
+    ];
+    
+    const isAnalysisRequest = analysisPatterns.some(pattern => pattern.test(lowerText));
+    
+    if (isAnalysisRequest) {
+      return {
+        isAnalysisRequest: true,
+        confidence: 0.95,
+        action: text
+      };
+    }
 
     // Detect retrospective intent (describing something that already happened)
     const isRetrospective = this._detectRetrospectiveIntent(text);

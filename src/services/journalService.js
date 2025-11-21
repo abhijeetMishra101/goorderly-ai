@@ -730,6 +730,21 @@ class JournalService {
     
     console.log(`[DEBUG] SmartRouter result:`, extractedData);
 
+    // Check if this is an analysis request
+    if (extractedData.isAnalysisRequest === true) {
+      console.log(`[DEBUG] Detected ANALYSIS REQUEST`);
+      
+      // Fill End of Day Analysis
+      const analysisResult = await this.fillEndOfDayAnalysis(documentId);
+      
+      return {
+        success: true,
+        isAnalysisRequest: true,
+        analysis: analysisResult.analysis,
+        usedLLM: extractedData.usedLLM || false
+      };
+    }
+
     // Check if this is a reminder
     // Allow fallback if LLM failed but simple detection found reminder with basic info
     if (extractedData.isReminder === true) {
@@ -1844,6 +1859,54 @@ class JournalService {
       return analysis;
     } catch (error) {
       throw new Error(`Failed to analyze journal: ${error.message}`);
+    }
+  }
+
+  /**
+   * Fill End of Day Analysis section using LLM
+   * @param {string} documentId - Journal document ID
+   * @param {string} date - Date in YYYY-MM-DD format (optional, defaults to today)
+   * @returns {Promise<Object>} Analysis result
+   */
+  async fillEndOfDayAnalysis(documentId, date = null) {
+    try {
+      // Get journal content
+      const journalText = await this.driveService.getDocumentText(documentId);
+      
+      if (!journalText || journalText.trim().length === 0) {
+        throw new Error('Journal is empty - cannot generate analysis');
+      }
+
+      // Log journal details for debugging
+      console.log(`[JournalService] Journal content retrieved:`);
+      console.log(`[JournalService] - Length: ${journalText.length} characters`);
+      console.log(`[JournalService] - First 200 chars: ${journalText.substring(0, 200)}...`);
+      console.log(`[JournalService] - Last 200 chars: ...${journalText.substring(journalText.length - 200)}`);
+
+      // Use LLM to analyze journal content
+      const LLMService = require('./llmService');
+      const llmService = new LLMService();
+      
+      console.log(`[JournalService] Starting LLM analysis...`);
+      const analysis = await llmService.analyzeJournalContent(journalText);
+      
+      console.log(`[JournalService] Analysis complete:`, {
+        productivityScore: analysis.productivityScore,
+        whatWentWell: analysis.whatWentWell.substring(0, 50) + '...',
+        whatDidntGoWell: analysis.whatDidntGoWell.substring(0, 50) + '...'
+      });
+
+      // Insert analysis into document
+      await this.driveService.insertEndOfDayAnalysis(documentId, analysis);
+      
+      console.log(`[JournalService] End of Day Analysis inserted successfully`);
+
+      return {
+        success: true,
+        analysis: analysis
+      };
+    } catch (error) {
+      throw new Error(`Failed to fill End of Day Analysis: ${error.message}`);
     }
   }
 }

@@ -1408,6 +1408,156 @@ class GoogleDriveService {
       throw new Error(`Failed to find journals in date range: ${error.message}`);
     }
   }
+
+  /**
+   * Insert End of Day Analysis into journal document
+   * @param {string} documentId - Document ID
+   * @param {Object} analysis - Analysis object with whatWentWell, whatDidntGoWell, productivityScore, mentalPhysicalState, improvements
+   * @returns {Promise<Object>} Success result
+   */
+  async insertEndOfDayAnalysis(documentId, analysis) {
+    await this._initializeAPIs();
+    try {
+      const doc = await this.docs.documents.get({
+        documentId
+      });
+
+      // Find the End of Day Analysis section
+      const bodyContent = doc.data.body.content;
+      let analysisIndex = -1;
+      
+      for (let i = 0; i < bodyContent.length; i++) {
+        const element = bodyContent[i];
+        if (element.paragraph && element.paragraph.elements) {
+          let paragraphText = '';
+          element.paragraph.elements.forEach(elem => {
+            if (elem.textRun && elem.textRun.content) {
+              paragraphText += elem.textRun.content;
+            }
+          });
+          
+          if (paragraphText.includes('📊 End of Day Analysis') || 
+              paragraphText.includes('End of Day Analysis') ||
+              paragraphText.toLowerCase().includes('end of day analysis')) {
+            analysisIndex = i;
+            break;
+          }
+        }
+      }
+
+      if (analysisIndex === -1) {
+        throw new Error('End of Day Analysis section not found in document');
+      }
+
+      // Build replacement requests for each section
+      // We'll use a more flexible approach: find the section and replace content after it
+      const requests = [];
+      
+      // Get document text to find exact positions
+      const docText = await this.getDocumentText(documentId);
+      const lines = docText.split('\n');
+      
+      // Find section indices
+      let whatWentWellIndex = -1;
+      let whatDidntGoWellIndex = -1;
+      let productivityScoreIndex = -1;
+      let mentalPhysicalStateIndex = -1;
+      let improvementsIndex = -1;
+      
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line.includes('🎯 What went well') && whatWentWellIndex === -1) {
+          whatWentWellIndex = i;
+        } else if (line.includes('🚫 What didn') && line.includes('go well') && whatDidntGoWellIndex === -1) {
+          whatDidntGoWellIndex = i;
+        } else if (line.includes('📈 Productivity Score') && productivityScoreIndex === -1) {
+          productivityScoreIndex = i;
+        } else if (line.includes('🧠 Mental/Physical State') && mentalPhysicalStateIndex === -1) {
+          mentalPhysicalStateIndex = i;
+        } else if (line.includes('🌱 What to improve tomorrow') && improvementsIndex === -1) {
+          improvementsIndex = i;
+        }
+      }
+      
+      // Use replaceAllText for each section (more reliable than index-based)
+      // Replace "🎯 What went well" and content until next section
+      if (whatWentWellIndex >= 0) {
+        requests.push({
+          replaceAllText: {
+            containsText: {
+              text: '🎯 What went well',
+              matchCase: false
+            },
+            replaceText: `🎯 What went well\n\n${analysis.whatWentWell}\n`
+          }
+        });
+      }
+
+      // Replace "🚫 What didn't go well" section
+      if (whatDidntGoWellIndex >= 0) {
+        requests.push({
+          replaceAllText: {
+            containsText: {
+              text: '🚫 What didn',
+              matchCase: false
+            },
+            replaceText: `🚫 What didn't go well\n\n${analysis.whatDidntGoWell}\n`
+          }
+        });
+      }
+
+      // Replace "📈 Productivity Score" section
+      if (productivityScoreIndex >= 0) {
+        requests.push({
+          replaceAllText: {
+            containsText: {
+              text: '📈 Productivity Score',
+              matchCase: false
+            },
+            replaceText: `📈 Productivity Score (1–10): ${analysis.productivityScore}\n`
+          }
+        });
+      }
+
+      // Replace "🧠 Mental/Physical State" section
+      if (mentalPhysicalStateIndex >= 0) {
+        requests.push({
+          replaceAllText: {
+            containsText: {
+              text: '🧠 Mental/Physical State',
+              matchCase: false
+            },
+            replaceText: `🧠 Mental/Physical State:\n\n${analysis.mentalPhysicalState}\n`
+          }
+        });
+      }
+
+      // Replace "🌱 What to improve tomorrow" section
+      if (improvementsIndex >= 0) {
+        requests.push({
+          replaceAllText: {
+            containsText: {
+              text: '🌱 What to improve tomorrow',
+              matchCase: false
+            },
+            replaceText: `🌱 What to improve tomorrow:\n\n${analysis.improvements}\n`
+          }
+        });
+      }
+
+      // Execute all replacements
+      await this.docs.documents.batchUpdate({
+        documentId,
+        requestBody: {
+          requests: requests
+        }
+      });
+
+      return { success: true };
+    } catch (error) {
+      throw new Error(`Failed to insert End of Day Analysis: ${error.message}`);
+    }
+  }
 }
 
 module.exports = {

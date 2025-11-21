@@ -37,6 +37,16 @@ function createJournalRoutes() {
         context
       });
 
+      // Check if this is an analysis request
+      if (result.isAnalysisRequest) {
+        return res.json({
+          success: true,
+          message: 'Day analysis completed successfully',
+          isAnalysisRequest: true,
+          analysis: result.analysis || null
+        });
+      }
+
       res.json({
         success: true,
         message: 'Voice entry logged successfully',
@@ -134,6 +144,42 @@ function createJournalRoutes() {
       const content = await journalService.getJournalContent(journalId);
       res.setHeader('Content-Type', 'text/plain');
       res.send(content);
+    } catch (error) {
+      res.status(500).json({
+        error: error.message
+      });
+    }
+  });
+
+  // POST /api/journal/:date/analyze
+  router.post('/:date/analyze', async (req, res) => {
+    try {
+      const journalService = req.journalService;
+      const { date } = req.params;
+
+      if (!isValidDateFormat(date)) {
+        return res.status(400).json({
+          error: 'Invalid date format. Expected YYYY-MM-DD'
+        });
+      }
+
+      // Find journal for the specified date
+      const journal = await journalService.findJournalByDate(date);
+
+      if (!journal) {
+        return res.status(404).json({
+          error: 'Journal not found for the specified date'
+        });
+      }
+
+      // Fill End of Day Analysis
+      const result = await journalService.fillEndOfDayAnalysis(journal.id, date);
+
+      res.json({
+        success: true,
+        message: 'Day analysis completed successfully',
+        analysis: result.analysis
+      });
     } catch (error) {
       res.status(500).json({
         error: error.message

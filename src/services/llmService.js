@@ -168,6 +168,9 @@ IMPORTANT - Time Reference Intelligence:
     - If it's late afternoon/evening (after 2 PM) → if time has passed today, likely means AM tomorrow; if not passed, could be PM today
     - Use context clues (e.g., "drop to school" suggests morning/AM, "dinner" suggests evening/PM)
 
+Is this an ANALYSIS REQUEST? If user asks to analyze their day (e.g., "perform analysis of my day", "analyze my day", "end of day analysis"), return JSON:
+{"isAnalysisRequest":true,"action":"analyze"}
+
 Is this a REMINDER? If yes, return JSON:
 {"isReminder":true,"task":"...","targetDate":"YYYY-MM-DD","targetTime":"HH:MM","mentionedPersons":[],"sentiment":"neutral","inferredHashtags":[],"actions":["reminder"]}
 
@@ -217,6 +220,15 @@ JSON only:`;
       }
       
       const parsed = JSON.parse(jsonMatch[0]);
+      
+      // Handle analysis request
+      if (parsed.isAnalysisRequest === true) {
+        return {
+          isAnalysisRequest: true,
+          action: parsed.action || 'analyze',
+          usedLLM: true
+        };
+      }
       
       // Handle reminder entries
       if (parsed.isReminder === true) {
@@ -362,6 +374,458 @@ JSON only:`;
     if (/home|family|personal/i.test(lowerText)) return 'personal';
 
     return null;
+  }
+
+  /**
+   * Analyze journal content and generate End of Day Analysis
+   * @param {string} journalText - Full journal content for the day
+   * @returns {Promise<Object>} Analysis result with insights
+   */
+  async analyzeJournalContent(journalText) {
+    console.log(`[LLM Service] ===== analyzeJournalContent START =====`);
+    console.log(`[LLM Service] Input journalText type: ${typeof journalText}`);
+    console.log(`[LLM Service] Input journalText length: ${journalText ? journalText.length : 'null/undefined'}`);
+    
+    // Quick health check before making request
+    console.log(`[LLM Service] Checking Ollama health...`);
+    const isHealthy = await this.checkHealth();
+    if (!isHealthy) {
+      throw new Error('LLM service unavailable - Ollama is not running or not accessible');
+    }
+    console.log(`[LLM Service] Ollama health check passed`);
+
+    // If journal is very long, use chunking and summarization
+    const CHUNK_SIZE = 1500; // Characters per chunk (reduced for faster processing)
+    let processedJournalText = journalText;
+    
+    console.log(`[LLM Service] Journal text length: ${journalText.length} characters`);
+    console.log(`[LLM Service] CHUNK_SIZE threshold: ${CHUNK_SIZE} characters`);
+    console.log(`[LLM Service] Will chunk? ${journalText.length > CHUNK_SIZE ? 'YES' : 'NO'}`);
+    
+    if (journalText.length > CHUNK_SIZE) {
+      console.log(`[LLM Service] ✓ Journal text is long (${journalText.length} chars > ${CHUNK_SIZE}), using chunking and summarization`);
+      try {
+        console.log(`[LLM Service] Calling _chunkAndSummarize...`);
+        processedJournalText = await this._chunkAndSummarize(journalText, CHUNK_SIZE);
+        console.log(`[LLM Service] ✓ Summarized journal to ${processedJournalText.length} characters`);
+      } catch (error) {
+        console.error(`[LLM Service] ✗ Chunking failed:`, error);
+        console.error(`[LLM Service] Error stack:`, error.stack);
+        console.error(`[LLM Service] Using fallback: last ${CHUNK_SIZE} chars`);
+        // Fallback: use last chunk if chunking fails
+        processedJournalText = '...' + journalText.slice(-CHUNK_SIZE);
+      }
+    } else {
+      console.log(`[LLM Service] ✓ Journal is short enough (${journalText.length} chars <= ${CHUNK_SIZE}), processing directly`);
+    }
+    
+    console.log(`[LLM Service] Final processedJournalText length: ${processedJournalText.length} characters`);
+
+    // Filter out template/placeholder text to focus on actual journal entries
+    const filteredText = this._filterTemplateText(processedJournalText);
+    console.log(`[LLM Service] Filtered journal text length: ${filteredText.length} characters (removed ${processedJournalText.length - filteredText.length} chars of template)`);
+    
+    // If journal has very little actual content, return default analysis
+    if (filteredText.trim().length < 100) {
+      console.log(`[LLM Service] Journal has minimal content (${filteredText.length} chars), returning default analysis`);
+      return {
+        whatWentWell: 'Journal is mostly empty. Start logging your day to get personalized insights!',
+        whatDidntGoWell: 'No entries to analyze yet.',
+        productivityScore: 5,
+        mentalPhysicalState: 'Unable to determine from available entries.',
+        improvements: 'Add more journal entries throughout the day for better analysis.'
+      };
+    }
+    
+    const prompt = this._buildAnalysisPrompt(filteredText);
+    console.log(`[LLM Service] Prompt length: ${prompt.length} characters`);
+    
+    try {
+      console.log(`[LLM Service] Sending request to Ollama...`);
+      console.log(`[LLM Service] Prompt preview (first 300 chars): ${prompt.substring(0, 300)}...`);
+      const startTime = Date.now();
+      const response = await axios.post(`${this.apiUrl}/api/generate`, {
+        model: this.model,
+        prompt: prompt,
+        stream: false,
+        options: {
+          temperature: 0.1, // Very low temperature for faster, more focused responses
+          top_p: 0.6,
+          num_predict: 200 // Increased to ensure complete JSON response
+        }
+      }, {
+        timeout: 300000 // 300 second (5 minute) timeout for analysis
+      });
+      const duration = Date.now() - startTime;
+      console.log(`[LLM Service] ✓ Ollama response received in ${duration}ms`);
+      console.log(`[LLM Service] Response preview (first 200 chars): ${response.data.response.substring(0, 200)}...`);
+
+      const result = this._parseAnalysisResponse(response.data.response);
+      return result;
+    } catch (error) {
+      const errorType = error.code === 'ECONNABORTED' ? 'timeout' : 
+                       error.code === 'ECONNREFUSED' ? 'connection_refused' : 
+                       'unknown';
+      console.error(`[LLM Service] Analysis ${errorType} error:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Chunk journal text and summarize each chunk, then combine summaries
+   * @param {string} journalText - Full journal text
+   * @param {number} chunkSize - Size of each chunk in characters
+   * @returns {Promise<string>} Combined summary of all chunks
+   */
+  async _chunkAndSummarize(journalText, chunkSize) {
+    console.log(`[LLM Service] ===== _chunkAndSummarize START =====`);
+    console.log(`[LLM Service] Input: ${journalText.length} chars, chunkSize: ${chunkSize}`);
+    
+    // Split journal into chunks (try to break at paragraph boundaries)
+    const chunks = [];
+    let currentChunk = '';
+    
+    // Split by double newlines (paragraphs) first
+    const paragraphs = journalText.split(/\n\n+/);
+    console.log(`[LLM Service] Split into ${paragraphs.length} paragraphs`);
+    
+    for (let i = 0; i < paragraphs.length; i++) {
+      const paragraph = paragraphs[i];
+      const wouldBeLength = (currentChunk ? currentChunk.length + 2 : 0) + paragraph.length;
+      
+      if (wouldBeLength <= chunkSize) {
+        currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
+      } else {
+        if (currentChunk) {
+          chunks.push(currentChunk);
+          console.log(`[LLM Service] Created chunk ${chunks.length}: ${currentChunk.length} chars`);
+        }
+        // If single paragraph is longer than chunk size, split it
+        if (paragraph.length > chunkSize) {
+          console.log(`[LLM Service] Paragraph ${i} is too long (${paragraph.length} chars), splitting by sentences`);
+          // Split long paragraph by sentences
+          const sentences = paragraph.match(/[^.!?]+[.!?]+/g) || [paragraph];
+          let sentenceChunk = '';
+          for (const sentence of sentences) {
+            if ((sentenceChunk + sentence).length <= chunkSize) {
+              sentenceChunk += sentence;
+            } else {
+              if (sentenceChunk) {
+                chunks.push(sentenceChunk);
+                console.log(`[LLM Service] Created chunk ${chunks.length} from sentences: ${sentenceChunk.length} chars`);
+              }
+              sentenceChunk = sentence;
+            }
+          }
+          currentChunk = sentenceChunk;
+        } else {
+          currentChunk = paragraph;
+        }
+      }
+    }
+    if (currentChunk) {
+      chunks.push(currentChunk);
+      console.log(`[LLM Service] Created final chunk ${chunks.length}: ${currentChunk.length} chars`);
+    }
+    
+    console.log(`[LLM Service] ✓ Split journal into ${chunks.length} chunks total`);
+    
+    // Summarize each chunk (limit to max 10 chunks to prevent excessive processing)
+    const MAX_CHUNKS = 10;
+    const chunksToProcess = chunks.slice(0, MAX_CHUNKS);
+    if (chunks.length > MAX_CHUNKS) {
+      console.log(`[LLM Service] Limiting to first ${MAX_CHUNKS} chunks (out of ${chunks.length} total)`);
+    }
+    
+    const summaries = [];
+    for (let i = 0; i < chunksToProcess.length; i++) {
+      try {
+        console.log(`[LLM Service] Summarizing chunk ${i + 1}/${chunksToProcess.length} (${chunksToProcess[i].length} chars)...`);
+        const summary = await this._summarizeChunk(chunksToProcess[i], i + 1, chunksToProcess.length);
+        summaries.push(summary);
+        console.log(`[LLM Service] Chunk ${i + 1} summarized to ${summary.length} chars`);
+      } catch (error) {
+        console.warn(`[LLM Service] Failed to summarize chunk ${i + 1}, using truncated version:`, error.message);
+        // If summarization fails, use a truncated version of the chunk
+        summaries.push(chunksToProcess[i].substring(0, 200) + '...');
+      }
+    }
+    
+    // Combine all summaries
+    return summaries.join('\n\n');
+  }
+
+  /**
+   * Summarize a single chunk of journal text
+   * @param {string} chunk - Journal chunk to summarize
+   * @param {number} chunkNum - Chunk number (for context)
+   * @param {number} totalChunks - Total number of chunks
+   * @returns {Promise<string>} Summary of the chunk
+   */
+  async _summarizeChunk(chunk, chunkNum, totalChunks) {
+    const prompt = `Summarize journal section ${chunkNum}/${totalChunks}. Keep: activities, tasks, emotions, key events. Be brief:
+
+${chunk}
+
+Brief summary:`;
+
+    try {
+      const response = await axios.post(`${this.apiUrl}/api/generate`, {
+        model: this.model,
+        prompt: prompt,
+        stream: false,
+        options: {
+          temperature: 0.1, // Very low for factual summarization
+          top_p: 0.6,
+          num_predict: 50 // Very short summaries (1-2 sentences)
+        }
+      }, {
+        timeout: 20000 // 20 second timeout per chunk (faster)
+      });
+
+      return response.data.response.trim();
+    } catch (error) {
+      console.warn(`[LLM Service] Chunk ${chunkNum} summarization failed, using truncated chunk:`, error.message);
+      // Fallback: return first 200 chars of chunk if summarization fails
+      return chunk.substring(0, 200) + '...';
+    }
+  }
+
+  /**
+   * Filter out template text and placeholders from journal
+   * @param {string} journalText - Raw journal text
+   * @returns {string} Filtered text with only actual entries
+   */
+  _filterTemplateText(journalText) {
+    // Remove common template sections
+    const templatePatterns = [
+      /🗓️ Daily Journal[^\n]*\n/g,
+      /📋 To-Do List[^\n]*\n/g,
+      /🧠 Notes \/ Quick Logs[^\n]*\n/g,
+      /📝 Free-form Journal[^\n]*\n/g,
+      /Write anything here[^\n]*\n/g,
+      /Tag relevant people[^\n]*\n/g,
+      /⏰ Hourly Plan[^\n]*\n/g,
+      /Time Slot[^\n]*\n/g,
+      /Task Description[^\n]*\n/g,
+      /📊 End of Day Analysis[^\n]*\n/g,
+      /🎯 What went well[^\n]*\n/g,
+      /🚫 What didn't go well[^\n]*\n/g,
+      /📈 Productivity Score[^\n]*\n/g,
+      /🧠 Mental\/Physical State[^\n]*\n/g,
+      /Example:[^\n]*\n/g,
+      /🌱 What to improve tomorrow[^\n]*\n/g,
+      /^-\s*$/gm, // Empty bullet points
+      /^\s*$/gm, // Empty lines
+    ];
+    
+    let filtered = journalText;
+    for (const pattern of templatePatterns) {
+      filtered = filtered.replace(pattern, '');
+    }
+    
+    // Remove multiple consecutive newlines
+    filtered = filtered.replace(/\n{3,}/g, '\n\n');
+    
+    return filtered.trim();
+  }
+
+  /**
+   * Build prompt for journal analysis
+   * @param {string} journalText - Journal content (may be summarized and filtered)
+   * @returns {string} Formatted prompt
+   */
+  _buildAnalysisPrompt(journalText) {
+    return `Analyze these journal entries and provide End of Day Analysis. Return ONLY a single JSON object (not an array):
+
+${journalText}
+
+Return this exact JSON structure (replace values):
+{
+  "whatWentWell": "2-3 brief things that went well (as a single string, not array)",
+  "whatDidntGoWell": "2-3 brief challenges (as a single string, not array)",
+  "productivityScore": 7,
+  "mentalPhysicalState": "Brief description",
+  "improvements": "2-3 brief suggestions (as a single string, not array)"
+}
+
+IMPORTANT: 
+- Return ONLY the JSON object, no array, no extra text
+- All text fields must be STRINGS, not arrays
+- Productivity score: 1-10 integer
+- Separate multiple items with periods, not arrays`;
+  }
+
+  /**
+   * Parse LLM analysis response
+   * @param {string} llmResponse - Raw LLM response
+   * @returns {Object} Parsed analysis
+   */
+  _parseAnalysisResponse(llmResponse) {
+    try {
+      console.log(`[LLM Service] Parsing response, full length: ${llmResponse.length} chars`);
+      
+      // First, try to find a JSON object (not array)
+      let jsonMatch = llmResponse.match(/\{[\s\S]*\}/);
+      
+      // If no complete object found, try to extract incomplete JSON and fix it
+      if (!jsonMatch) {
+        // Try to find start of JSON object
+        const startMatch = llmResponse.match(/\{[\s\S]*/);
+        if (startMatch) {
+          console.warn(`[LLM Service] Incomplete JSON detected, attempting to fix...`);
+          let incompleteJson = startMatch[0].trim();
+          
+          // Remove trailing comma if present
+          incompleteJson = incompleteJson.replace(/,\s*$/, '');
+          
+          // Try to extract fields we can find
+          const parsed = this._parseIncompleteJSON(incompleteJson);
+          if (parsed) {
+            return this._validateAnalysisFields(parsed);
+          }
+        }
+        
+        // If no object found, try to find array and convert first element
+        const arrayMatch = llmResponse.match(/\[[\s\S]*\]/);
+        if (arrayMatch) {
+          console.warn(`[LLM Service] Response is an array, extracting first object`);
+          const array = JSON.parse(arrayMatch[0]);
+          if (Array.isArray(array) && array.length > 0 && typeof array[0] === 'object') {
+            // Convert array of entries to analysis format
+            return this._convertEntriesToAnalysis(array);
+          }
+        }
+        throw new Error('No JSON object or array found in analysis response');
+      }
+      
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch (parseError) {
+        // JSON might be incomplete, try to fix it
+        console.warn(`[LLM Service] JSON parse failed, attempting to fix incomplete JSON...`);
+        parsed = this._parseIncompleteJSON(jsonMatch[0]);
+        if (!parsed) {
+          throw parseError;
+        }
+      }
+      
+      // Check if it's an array (shouldn't be, but handle it)
+      if (Array.isArray(parsed)) {
+        console.warn(`[LLM Service] Parsed JSON is an array, converting to analysis format`);
+        return this._convertEntriesToAnalysis(parsed);
+      }
+      
+      // Validate and set defaults
+      return this._validateAnalysisFields(parsed);
+    } catch (error) {
+      console.error(`[LLM Service] JSON parsing error:`, error);
+      console.error(`[LLM Service] Response that failed:`, llmResponse.substring(0, 500));
+      throw new Error(`Failed to parse analysis response: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse incomplete JSON by extracting fields manually
+   * @param {string} incompleteJson - Incomplete JSON string
+   * @returns {Object|null} Parsed object or null if extraction fails
+   */
+  _parseIncompleteJSON(incompleteJson) {
+    const result = {};
+    
+    // Extract whatWentWell
+    const whatWentWellMatch = incompleteJson.match(/"whatWentWell"\s*:\s*"([^"]*)"/);
+    if (whatWentWellMatch) {
+      result.whatWentWell = whatWentWellMatch[1];
+    }
+    
+    // Extract whatDidntGoWell
+    const whatDidntGoWellMatch = incompleteJson.match(/"whatDidntGoWell"\s*:\s*"([^"]*)"/);
+    if (whatDidntGoWellMatch) {
+      result.whatDidntGoWell = whatDidntGoWellMatch[1];
+    }
+    
+    // Extract productivityScore
+    const productivityScoreMatch = incompleteJson.match(/"productivityScore"\s*:\s*(\d+)/);
+    if (productivityScoreMatch) {
+      result.productivityScore = parseInt(productivityScoreMatch[1]);
+    }
+    
+    // Extract mentalPhysicalState
+    const mentalPhysicalStateMatch = incompleteJson.match(/"mentalPhysicalState"\s*:\s*"([^"]*)"/);
+    if (mentalPhysicalStateMatch) {
+      result.mentalPhysicalState = mentalPhysicalStateMatch[1];
+    }
+    
+    // Extract improvements
+    const improvementsMatch = incompleteJson.match(/"improvements"\s*:\s*"([^"]*)"/);
+    if (improvementsMatch) {
+      result.improvements = improvementsMatch[1];
+    }
+    
+    // Return null if we couldn't extract anything useful
+    return Object.keys(result).length > 0 ? result : null;
+  }
+
+  /**
+   * Validate and set defaults for analysis fields
+   * @param {Object} parsed - Parsed analysis object
+   * @returns {Object} Validated analysis object with defaults
+   */
+  _validateAnalysisFields(parsed) {
+    // Convert arrays to strings if needed (LLM sometimes returns arrays)
+    const whatWentWell = Array.isArray(parsed.whatWentWell) 
+      ? parsed.whatWentWell.join('. ') 
+      : (parsed.whatWentWell || 'No specific highlights captured today.');
+    
+    const whatDidntGoWell = Array.isArray(parsed.whatDidntGoWell)
+      ? parsed.whatDidntGoWell.join('. ')
+      : (parsed.whatDidntGoWell || 'No major challenges noted today.');
+    
+    const improvements = Array.isArray(parsed.improvements)
+      ? parsed.improvements.join('. ')
+      : (parsed.improvements || 'Continue maintaining current routine.');
+    
+    return {
+      whatWentWell,
+      whatDidntGoWell,
+      productivityScore: Math.max(1, Math.min(10, parseInt(parsed.productivityScore) || 5)),
+      mentalPhysicalState: parsed.mentalPhysicalState || 'State not clearly indicated in entries.',
+      improvements
+    };
+  }
+
+  /**
+   * Convert array of journal entries to analysis format (fallback)
+   * @param {Array} entries - Array of entry objects
+   * @returns {Object} Analysis object
+   */
+  _convertEntriesToAnalysis(entries) {
+    // Extract insights from entries array
+    const positiveEntries = entries.filter(e => e.mood === 'positive' || e.sentiment === 'positive');
+    const negativeEntries = entries.filter(e => e.mood === 'negative' || e.sentiment === 'negative' || e.mood === 'lame');
+    
+    const whatWentWell = positiveEntries.length > 0 
+      ? `Completed ${positiveEntries.length} positive activities/entries.`
+      : 'No specific highlights captured today.';
+    
+    const whatDidntGoWell = negativeEntries.length > 0
+      ? `Encountered ${negativeEntries.length} challenges or negative experiences.`
+      : 'No major challenges noted today.';
+    
+    // Calculate productivity score based on entries
+    const totalEntries = entries.length;
+    const positiveRatio = positiveEntries.length / Math.max(totalEntries, 1);
+    const productivityScore = Math.max(1, Math.min(10, Math.round(5 + (positiveRatio * 5))));
+    
+    return {
+      whatWentWell,
+      whatDidntGoWell,
+      productivityScore,
+      mentalPhysicalState: 'Mixed state based on entries.',
+      improvements: 'Continue logging entries for better insights.'
+    };
   }
 }
 
