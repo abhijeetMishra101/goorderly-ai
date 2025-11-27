@@ -37,6 +37,16 @@ function createJournalRoutes() {
         context
       });
 
+      // Check if this is an analysis request
+      if (result.isAnalysisRequest) {
+        return res.json({
+          success: true,
+          message: 'Day analysis completed successfully',
+          isAnalysisRequest: true,
+          analysis: result.analysis || null
+        });
+      }
+
       res.json({
         success: true,
         message: 'Voice entry logged successfully',
@@ -45,7 +55,12 @@ function createJournalRoutes() {
         timeSlot: result.timeSlot || null,
         targetDate: result.targetDate || null,
         targetTime: result.targetTime || null,
-        convertedFromTimeSlot: result.convertedFromTimeSlot || false
+        convertedFromTimeSlot: result.convertedFromTimeSlot || false,
+        mentionedPersons: result.mentionedPersons || [],
+        sentiment: result.sentiment || 'neutral',
+        inferredHashtags: result.inferredHashtags || [],
+        actions: result.actions || [],
+        journalEntry: result.journalEntry || null
       });
     } catch (error) {
       res.status(500).json({
@@ -95,15 +110,13 @@ function createJournalRoutes() {
         });
       }
 
-      // Update template with hourly table
-      const result = await driveService.updateTemplateWithHourlyTable(templateDocId);
-
+      // Templates are now created from a reference document and should not be
+      // modified programmatically. The updateTemplateWithHourlyTable function
+      // would corrupt the table structure.
       res.json({
         success: true,
-        message: result.alreadyHasTable 
-          ? 'Template already has the hourly table' 
-          : 'Template updated successfully with hourly table',
-        alreadyHasTable: result.alreadyHasTable
+        message: 'Template is managed from reference document and does not need updating',
+        alreadyHasTable: true
       });
     } catch (error) {
       res.status(500).json({
@@ -131,6 +144,42 @@ function createJournalRoutes() {
       const content = await journalService.getJournalContent(journalId);
       res.setHeader('Content-Type', 'text/plain');
       res.send(content);
+    } catch (error) {
+      res.status(500).json({
+        error: error.message
+      });
+    }
+  });
+
+  // POST /api/journal/:date/analyze
+  router.post('/:date/analyze', async (req, res) => {
+    try {
+      const journalService = req.journalService;
+      const { date } = req.params;
+
+      if (!isValidDateFormat(date)) {
+        return res.status(400).json({
+          error: 'Invalid date format. Expected YYYY-MM-DD'
+        });
+      }
+
+      // Find journal for the specified date
+      const journal = await journalService.findJournalByDate(date);
+
+      if (!journal) {
+        return res.status(404).json({
+          error: 'Journal not found for the specified date'
+        });
+      }
+
+      // Fill End of Day Analysis
+      const result = await journalService.fillEndOfDayAnalysis(journal.id, date);
+
+      res.json({
+        success: true,
+        message: 'Day analysis completed successfully',
+        analysis: result.analysis
+      });
     } catch (error) {
       res.status(500).json({
         error: error.message

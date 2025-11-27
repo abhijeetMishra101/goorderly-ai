@@ -56,7 +56,7 @@ app.use('/llm', express.raw({ type: 'application/json', limit: '50mb' }), async 
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
-      timeout: 30000, // 30 second timeout for LLM requests (increased for CPU inference)
+      timeout: 7000, // 7 second timeout for faster failure and fallback
       validateStatus: () => true, // Don't throw on any status
     });
     

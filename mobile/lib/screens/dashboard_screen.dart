@@ -35,6 +35,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Timer? _speakingProgressTimer;
   String? _recognizedText; // Text that was heard
   bool _isCancelled = false; // Flag to track if user cancelled the recording
+  bool _isProcessingVoiceEntry = false; // Flag to prevent duplicate processing
+  bool _hasSpokenForCurrentEntry = false; // Flag to prevent double TTS announcements
   Map<String, dynamic>? _lastVoiceEntryResult; // Store last API response for announcement
 
   @override
@@ -64,6 +66,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _recognizedText = null;
       _voiceLevel = 0.0;
       _speakingProgress = 0.0;
+      _isProcessingVoiceEntry = false; // Reset processing flag
+      _hasSpokenForCurrentEntry = false; // Reset TTS flag
     });
     _updateVoiceState(VoiceState.idle);
   }
@@ -80,6 +84,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _voiceLevel = 0.0;
       _speakingProgress = 0.0;
       _isCancelled = false; // Reset cancellation flag for retry
+      _isProcessingVoiceEntry = false; // Reset processing flag for retry
+      _hasSpokenForCurrentEntry = false; // Reset TTS flag for retry
     });
     
     // Start a new recording session
@@ -288,6 +294,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _error = null;
       _voiceLevel = 0.0;
       _isCancelled = false; // Reset cancellation flag when starting new recording
+      _isProcessingVoiceEntry = false; // Reset processing flag when starting new recording
+      _hasSpokenForCurrentEntry = false; // Reset TTS flag when starting new recording
     });
 
     _updateVoiceState(VoiceState.listening);
@@ -358,6 +366,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
           }
           
           // Transition to speaking state and speak response
+          if (_hasSpokenForCurrentEntry) {
+            // We've already spoken for this entry (e.g., via another completion path)
+            return;
+          }
+          _hasSpokenForCurrentEntry = true;
           _updateVoiceState(VoiceState.speaking);
           
           // Initialize TTS if needed
@@ -415,10 +428,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Future<void> _handleVoiceEntry(String text) async {
     if (text.trim().isEmpty) return;
     
+    // Prevent duplicate processing if already processing
+    if (_isProcessingVoiceEntry) {
+      return; // Already processing, prevent duplicate call
+    }
+    
     // Check if cancelled before making API call
     if (_isCancelled) {
       return; // User cancelled, don't make API call
     }
+    
+    // Set processing flag to prevent duplicate calls
+    _isProcessingVoiceEntry = true;
 
     setState(() {
       _error = null;
@@ -470,6 +491,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
           _error = 'Failed to log entry: ${e.toString()}';
         });
       }
+    } finally {
+      // Reset processing flag when done
+      _isProcessingVoiceEntry = false;
     }
   }
 
@@ -479,10 +503,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
       return "Making a note of it right away";
     }
 
+    final isAnalysisRequest = _lastVoiceEntryResult!['isAnalysisRequest'] as bool? ?? false;
     final isReminder = _lastVoiceEntryResult!['isReminder'] as bool? ?? false;
     final timeSlot = _lastVoiceEntryResult!['timeSlot'] as String?;
     final targetDate = _lastVoiceEntryResult!['targetDate'] as String?;
     final targetTime = _lastVoiceEntryResult!['targetTime'] as String?;
+    final mentionedPersons = _lastVoiceEntryResult!['mentionedPersons'] as List<dynamic>? ?? [];
+    final actions = _lastVoiceEntryResult!['actions'] as List<dynamic>? ?? [];
+    final sentiment = _lastVoiceEntryResult!['sentiment'] as String? ?? 'neutral';
+
+    // Handle analysis request
+    if (isAnalysisRequest) {
+      return "Day analysis completed. Check your journal for insights.";
+    }
+
+    // Build announcement parts
+    final announcementParts = <String>[];
 
     // If it's a reminder (including converted from time slot)
     if (isReminder) {
@@ -503,17 +539,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
         final timeStr = minute > 0 ? '$hour12:${minute.toString().padLeft(2, '0')} $ampm' : '$hour12 $ampm';
         
         if (isToday) {
-          return "Reminder set for $timeStr today";
+          announcementParts.add("Reminder set for $timeStr today");
         } else {
-          return "Reminder set for $timeStr tomorrow";
+          announcementParts.add("Reminder set for $timeStr tomorrow");
         }
       } else {
-        return "Reminder created";
+        announcementParts.add("Reminder created");
       }
     }
     
-    // If it has a time slot (scheduled for today)
-    if (timeSlot != null) {
+    // Handle time slot action
+    if (timeSlot != null && (actions.isEmpty || actions.contains('timeSlot'))) {
       // Extract time from time slot (e.g., "7:00 - 8:00 AM" -> "7 AM")
       final timeMatch = RegExp(r'(\d{1,2}):(\d{2})\s*-\s*\d{1,2}:\d{2}\s*(AM|PM)', caseSensitive: false)
           .firstMatch(timeSlot);
@@ -523,9 +559,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
         final ampm = timeMatch.group(3)!.toUpperCase();
         final hour12 = hour > 12 ? hour - 12 : (hour == 0 ? 12 : hour);
         final timeStr = minute > 0 ? '$hour12:$minute $ampm' : '$hour12 $ampm';
-        return "Note created for $timeStr today";
+        announcementParts.add("Added to $timeStr time slot");
+      } else {
+        announcementParts.add("Note scheduled for $timeSlot");
       }
-      return "Note scheduled for $timeSlot";
+    }
+    
+    // Handle journal action with person mentions
+    if (actions.contains('journal') || mentionedPersons.isNotEmpty) {
+      if (mentionedPersons.isNotEmpty) {
+        final personNames = mentionedPersons.join(' and ');
+        final sentimentText = sentiment == 'positive' ? 'positive note' : 
+                             sentiment == 'negative' ? 'note' : 'note';
+        announcementParts.add("Noted about $personNames in journal");
+      } else {
+        announcementParts.add("Added to journal");
+      }
+    }
+    
+    // Combine announcement parts
+    if (announcementParts.isNotEmpty) {
+      return announcementParts.join(' and ');
     }
     
     // Default fallback
@@ -605,6 +659,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                     return;
                                   }
                                   
+                                  if (_hasSpokenForCurrentEntry) {
+                                    // We've already spoken for this entry via another path
+                                    return;
+                                  }
+                                  _hasSpokenForCurrentEntry = true;
                                   _updateVoiceState(VoiceState.speaking);
                                   if (!_ttsService.isInitialized) {
                                     await _ttsService.initialize();
